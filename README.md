@@ -1,2 +1,2 @@
 # MultiAgentSystem_Absidoc
-Repositorio destinado a la gestion del Sitema MultiAgente de Absidoc
+Repositorio destinado a la gestion del Sistema MultiAgente de Absidoc
