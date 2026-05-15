@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+google-adk
+google-cloud-aiplatform
+google-cloud-discoveryengine
+google-cloud-secret-manager
+google-auth
+python-dotenv
+# El nombre correcto es este:
+cloud-sql-python-connector[pg8000]
+sqlalchemy
+pg8000
