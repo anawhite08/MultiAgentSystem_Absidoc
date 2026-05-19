@@ -10,3 +10,4 @@ python-dotenv
 cloud-sql-python-connector[pg8000]
 sqlalchemy
 pg8000
+python-multipart
