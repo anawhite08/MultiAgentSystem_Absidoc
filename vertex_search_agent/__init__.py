@@ -1,8 +1,10 @@
-﻿from . import agent
 import os
 from dotenv import load_dotenv
 
+# Cargar variables de entorno antes de importar el módulo de agentes
 load_dotenv()
+
+from . import agent
 
 GOOGLE_ENGINE_ID = os.getenv("GOOGLE_ENGINE_ID")
 GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
