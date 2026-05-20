@@ -4,6 +4,7 @@ FROM python:3.11-slim
 # 2. Evitar que Python genere archivos .pyc y asegurar que los logs salgan en tiempo real
 ENV PYTHONUNBUFFERED True
 ENV APP_HOME /app
+ENV GOOGLE_GENAI_USE_VERTEXAI True
 WORKDIR $APP_HOME
 
 # 3. Instalar dependencias del sistema necesarias para conectores de BD (si fuera necesario)
