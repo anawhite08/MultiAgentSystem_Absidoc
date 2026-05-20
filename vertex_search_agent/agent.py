@@ -200,6 +200,8 @@ def navegar_software(id_trabajador: str, id_documento: str) -> dict:
     """
     return {
         "action": "OPEN_EXPEDIENTE",
+        "id_trabajador": id_trabajador,
+        "id_documento": id_documento,
         "worker_id": id_trabajador,
         "document_id": id_documento,
         "url": f"/explorer/{id_trabajador}",
@@ -239,12 +241,14 @@ analista_sql = Agent(
     model="gemini-2.5-pro",  # Cambiado a Pro para un análisis de alta precisión en PostgreSQL
     tools=[ejecutar_consulta_sql_dinamica],
     instruction="""
-    Eres el Analista Experto en Base de Datos de RRHH. Tu única responsabilidad es generar y ejecutar consultas SQL en PostgreSQL para obtener datos estructurados. [cite: 57]
+    Eres el Analista Experto en Base de Datos de RRHH. Tu única responsabilidad es generar y ejecutar consultas SQL en PostgreSQL para obtener datos estructurados.
 
     ESQUEMA DE TABLAS DISPONIBLE:
-    - recurso (id_recurso, titulo, id_recurso_padre, id_version_activa, id_tipo_recurso, estado) [cite: 57]
-    - version (id_version, fecha_vencimiento, metadata, id_recurso, resumen) [cite: 57]
-    - tipo_recurso (id_tipo_recurso, estructura, nombre, descripcion) [cite: 57]
+    - recurso (id_recurso, titulo, id_recurso_padre, id_version_activa, id_tipo_recurso, estado)
+    - version (id_version, fecha_vencimiento, metadata, id_recurso, resumen, fecha_creacion)
+    - tipo_recurso (id_tipo_recurso, estructura, nombre, descripcion)
+    - catalogo_tipos_expediente (id_tipo_expediente, nombre_tipo)
+    - requisitos_expediente (id_tipo_expediente, id_tipo_recurso_obligatorio, obligatorio)
 
     REGLAS CRÍTICAS DE NEGOCIO:
     1. RELACIÓN DE METADATA: La columna 'metadata' (JSONB) se encuentra ÚNICAMENTE en la tabla 'version'. Para consultar, filtrar o extraer cualquier información de un documento, DEBES hacer un JOIN: `recurso r JOIN version v ON r.id_version_activa = v.id_version`. 
@@ -259,26 +263,44 @@ analista_sql = Agent(
 
     4. IDENTIFICADORES (UUIDs) DE TIPOS DE RECURSO Y SUS LLAVES COMUNES:
        - Expediente del trabajador: '36e88186-f873-40cd-a1eb-f4bc3dd18af1' 
-       - Cumpleaños: '883bcc87-e00d-4abb-b7b0-bc8ae6211d22' -> Buscar fecha en la llave correspondiente en metadata (ej. metadata ->> 'fecha_nacimiento'). [cite: 59]
-       - Contratos: '139be00e-2d43-4093-b9f8-e600b405efe3' -> Buscar atributos en las llaves de metadata (ej. metadata ->> 'fecha_inicio', metadata ->> 'tipo_contrato'). [cite: 59, 62]
+       - Cumpleaños: '883bcc87-e00d-4abb-b7b0-bc8ae6211d22' -> Buscar fecha en la llave correspondiente en metadata (ej. metadata ->> 'fecha_nacimiento').
+       - Contratos: '139be00e-2d43-4093-b9f8-e600b405efe3' -> Buscar atributos en las llaves de metadata (ej. metadata ->> 'fecha_inicio', metadata ->> 'tipo_contrato').
        - Certificación Google: '451b234c-a3c1-4653-be73-b26514cf2853' -> El nombre o curso se lee de las llaves mapeadas en metadata (ej. metadata ->> 'Titulo_de_la_Certificacion_o_Curso').
        - Certificación SAP: '91afb78a-1cf3-49e5-af53-2996e6baa4ac' -> El nombre o curso se lee de las llaves mapeadas en metadata (ej. metadata ->> 'Titulo_de_la_Certificacion_o_Curso').
 
-    5. BÚSQUEDA POR TRABAJADOR: Usa `recurso.titulo ILIKE '%nombre%'` o descompón con `%` ÚNICAMENTE cuando busques la carpeta raíz del trabajador (id_tipo_recurso de expediente). [cite: 58, 65]
-    6. ESTADO Y NAVEGACIÓN: Filtra siempre por `estado = 'activo'` a menos que se indique lo contrario[cite: 66]. Recupera SIEMPRE `id_recurso` e `id_recurso_padre`. [cite: 66]
+    5. BÚSQUEDA POR TRABAJADOR: Usa `recurso.titulo ILIKE '%nombre%'` o descompón con `%` ÚNICAMENTE cuando busques la carpeta raíz del trabajador (id_tipo_recurso de expediente).
+    6. ESTADO Y NAVEGACIÓN: Filtra siempre por `estado = 'activo'` a menos que se indique lo contrario. Recupera SIEMPRE `id_recurso` e `id_recurso_padre`. 
 
     GUÍA DE FECHAS (Contratos Laborales):
-    - Fecha de Ingreso: Es el valor de la fecha inicial dentro de la metadata de la versión MÁS ANTIGUA de su contrato laboral (según `fecha_creacion` en la tabla `version`). [cite: 60, 61]
-    - Fecha de Contratación: Es el valor de la fecha inicial de la primera versión en el historial donde la llave del tipo de contrato en metadata sea exactamente 'Contrato determinado' o 'Contrato indeterminado'. [cite: 62]
+    - Fecha de Ingreso: Es el valor de la fecha inicial dentro de la metadata de la versión MÁS ANTIGUA de su contrato laboral (según `fecha_creacion` en la tabla `version`).
+    - Fecha de Contratación: Es el valor de la fecha inicial de la primera versión en el historial donde la llave del tipo de contrato en metadata sea exactamente 'Contrato determinado' o 'Contrato indeterminado'.
 
     CÁLCULO DE VACACIONES (Art. 190 LOTTT):
-    - Año 1: 15 días, Año 2: 16, Año 3: 17... (máximo 30 días por año). Realiza la sumatoria acumulada total desde su fecha de contratación hasta la fecha actual. [cite: 81, 82]
+    - Año 1: 15 días, Año 2: 16, Año 3: 17... (máximo 30 días por año). Realiza la sumatoria acumulada total desde su fecha de contratación hasta la fecha actual.
+
+    REGLA DE VERIFICACIÓN DE EXPEDIENTES COMPLETOS Y DOCUMENTOS FALTANTES:
+    - Se activa si el usuario pregunta si un expediente está completo, qué documentos le faltan a un trabajador, o qué expediente está menos completo.
+    - Paso A (Carpeta del Trabajador): Ubicar el `recurso` del expediente del trabajador (`id_tipo_recurso = '36e88186-f873-40cd-a1eb-f4bc3dd18af1'`) por su nombre `titulo ILIKE '%[Nombre]%'` con `estado = 'activo'`.
+    - Paso B (Determinar su Tipo de Expediente):
+      - Buscar todas las versiones de recursos de tipo Contratos (`id_tipo_recurso = '139be00e-2d43-4093-b9f8-e600b405efe3'`) que pertenezcan a la carpeta del trabajador (`id_recurso_padre` es el `id_recurso` de la carpeta).
+      - Identificar la versión más reciente según su `fecha_creacion DESC` en la tabla `version` y obtener su tipo de contrato de la metadata usando: `COALESCE(metadata ->> 'tipo_contrato', metadata ->> 'tipo')`.
+      - Cruzar este valor obtenido con `nombre_tipo` en `catalogo_tipos_expediente` para obtener el `id_tipo_expediente` correspondiente (los 4 valores posibles son 'Contrato determinado', 'Contrato indeterminado', 'Convenio de talent' y 'Convenio de pasante').
+    - Paso C (Obtener Requisitos Obligatorios):
+      - Buscar en `requisitos_expediente` todos los `id_tipo_recurso_obligatorio` donde `id_tipo_expediente` sea el del trabajador y `obligatorio = True`. Unir con `tipo_recurso` para obtener el `nombre` legible de cada requisito obligatorio.
+    - Paso D (Cruzar Requisitos con Documentos Presentes):
+      - Buscar los recursos activos (`estado = 'activo'`) bajo la carpeta del trabajador (`id_recurso_padre` igual a la del trabajador) y verificar si existen sus correspondientes `id_tipo_recurso` en la lista de requisitos.
+      - Si existe algún recurso activo del tipo requerido bajo su carpeta, el documento está "Cumplido". Si no existe ninguno, está "Faltante".
+      - El porcentaje de completitud se calcula como: `(Número de requisitos cumplidos / Número total de requisitos obligatorios) * 100`.
+    - Paso E (Presentación - ESTRICTAMENTE SIN ASTERISCOS):
+      - Presenta un reporte conciso: indica el nombre del trabajador, su tipo de expediente detectado, la lista detallada de documentos obligatorios que le faltan (faltantes), los que ya tiene (cumplidos) y el porcentaje total de completitud.
+      - Si te preguntan cuál expediente está "menos completo", calcula esta completitud para todos los trabajadores y muestra el listado ordenado de menor a mayor completitud de forma resumida.
+      - REGLA DE FORMATO ESTRICTA: Queda absolutamente prohibido usar el carácter de asterisco (*) bajo cualquier circunstancia. No lo uses para viñetas (usa guiones medios '-' o números '1.', '2.') y no lo uses para negritas (no uses '**'). Para resaltar títulos o secciones importantes, escríbelas en MAYÚSCULAS o simplemente como texto normal. Por ejemplo, en lugar de '**Completitud:**' escribe 'COMPLETITUD:' o 'Completitud:'.
 
     LISTAR DOCUMENTOS DE UN EXPEDIENTE:
-    Al listar los documentos de un trabajador, diseña la consulta estructurada usando un `WITH RECURSIVE` para traer los hijos directos del `id_recurso` de su expediente, uniendo las tablas de versiones, estructura_organizativa, tipo_recurso, sub_etiqueta y etiqueta[cite: 67, 70, 76, 77]. Mapea los resultados leyendo las propiedades dinámicas de la metadata según lo dictado por la estructura del tipo de recurso.
+    Al listar los documentos de un trabajador, diseña la consulta estructurada usando un `WITH RECURSIVE` para traer los hijos directos del `id_recurso` de su expediente, uniendo las tablas de versiones, estructura_organizativa, tipo_recurso, sub_etiqueta y etiqueta. Mapea los resultados leyendo las propiedades dinámicas de la metadata según lo dictado por la estructura del tipo de recurso.
 
     IMPORTANTE: Si la pregunta del usuario es un saludo (ej. "Hola", "Buenos días") o no requiere base de datos, responde de inmediato con un texto vacío "" y delega el control.
-    Responde en español. Sin asteriscos (*). [cite: 84]
+    Responde en español. Sin asteriscos (*) en absoluto.
     """,
 )
 
@@ -348,7 +370,8 @@ buscador_web = Agent(
 KEYWORDS_SQL = [
     "vacaciones", "cumple", "nacimiento", "contrato", "ingreso", "contratación",
     "recurso", "expediente", "trabajador", "empleado", "lista", "listar",
-    "cumplen", "edad", "sueldo", "salario"
+    "cumplen", "edad", "sueldo", "salario", "documento", "documentos",
+    "falta", "faltan", "completo", "incompleto", "completitud", "requisito", "requisitos"
 ]
 
 KEYWORDS_RAG = [
@@ -524,7 +547,7 @@ director_final = Agent(
 
     FORMATO GENERAL:
     - Responde siempre en español de forma ejecutiva, clara y concisa. 
-    - Queda estrictamente PROHIBIDO el uso de asteriscos (*) en tus respuestas de texto plano. 
+    - Queda estrictamente PROHIBIDO el uso de asteriscos (*) bajo cualquier circunstancia en tus respuestas. No utilices negritas de markdown (no uses '**' ni '*'). Si necesitas dar énfasis o destacar títulos/secciones, escríbelas en MAYÚSCULAS o simplemente como texto normal sin símbolos adicionales. Tampoco uses asteriscos para viñetas (usa guiones medios '-' o numeración).
     - Identifica al trabajador por su nombre/título. 
     """,
 )
