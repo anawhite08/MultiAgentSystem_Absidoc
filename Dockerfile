@@ -34,7 +34,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 5. Copiar el resto del código de la aplicación
 COPY . .
 
-# 7. Ejecutar la aplicación
-# NOTA: Cloud Run espera un servidor HTTP (como Flask o FastAPI) que envuelva a tus agentes.
-# Usa el shell para expandir la variable PORT que da Google
-CMD ["sh", "-c", "adk web --host 0.0.0.0 --port ${PORT:-8000} --allow_origins '*'"]
+CMD ["sh", "-c", "python main.py"]
