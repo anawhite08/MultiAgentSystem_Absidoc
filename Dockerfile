@@ -4,7 +4,18 @@ FROM python:3.11-slim
 # 2. Evitar que Python genere archivos .pyc y asegurar que los logs salgan en tiempo real
 ENV PYTHONUNBUFFERED True
 ENV APP_HOME /app
-ENV GOOGLE_GENAI_USE_VERTEXAI True
+ENV GOOGLE_GENAI_USE_VERTEXAI true
+ENV GOOGLE_CLOUD_PROJECT absidedoc
+ENV GOOGLE_CLOUD_LOCATION us-central1
+ENV GOOGLE_ENGINE_ID absidedoc_1771937853551
+ENV AGENT_PATH /
+ENV SERVICE_NAME vertex_search_agent
+ENV APP_NAME vertex_search_agent_app
+ENV direccion absidedoc:us-central1:vzabsdocprd
+ENV userbd postgres
+ENV passwordbd K@*|o9gb*ayOa.XJ
+ENV bd postgres
+ENV GESTOR_API_BASE_URL https://gestor-api-302797487278.us-central1.run.app
 WORKDIR $APP_HOME
 
 # 3. Instalar dependencias del sistema necesarias para conectores de BD (si fuera necesario)
