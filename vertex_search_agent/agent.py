@@ -14,10 +14,11 @@ from typing import AsyncGenerator
 
 
 # --- HELPER DE EVENTOS ADK ---
-def crear_evento_texto(autor: str, texto: str) -> Event:
+def crear_evento_texto(autor: str, texto: str, partial: bool = None) -> Event:
     return Event(
         author=autor,
-        content=Content(parts=[Part(text=texto)])
+        content=Content(parts=[Part(text=texto)]),
+        partial=partial
     )
 from google.cloud import discoveryengine_v1 as discoveryengine
 from google.cloud.sql.connector import Connector, IPTypes
@@ -587,12 +588,20 @@ class AgenteDirectorOptimizado(BaseAgent):
         KEYWORDS_ACCION = ["busca", "búscame", "ubica", "ubícame", "encuentra", "abre", "consigue", "enviar", "envía", "enviame", "envíame", "correo", "email", "gmail"]
         requiere_accion = any(kw in msg_lower for kw in KEYWORDS_ACCION)
 
-        # Buscar las respuestas de los investigadores en los eventos de la sesión actual
-        respuestas_investigadores = {}
-        for event in ctx.session.events:
+        # 1. Encontrar el índice del último mensaje del usuario para aislar el turno actual
+        user_event_index = -1
+        for i, event in enumerate(ctx.session.events):
+            if getattr(event, "author", "") == "user":
+                user_event_index = i
+
+        # 2. Buscar las respuestas de los investigadores en los eventos únicamente de este turno actual
+        respuestas_acumuladas = {}
+        events_to_scan = ctx.session.events[user_event_index + 1 :] if user_event_index != -1 else ctx.session.events
+
+        for event in events_to_scan:
             autor = getattr(event, "author", "")
             if autor in ["analista_sql", "documental_rag", "buscador_web"]:
-                # Obtener el texto del contenido
+                # Obtener el texto del contenido de forma robusta
                 content_text = ""
                 content_obj = getattr(event, "content", None)
                 if content_obj:
@@ -606,21 +615,51 @@ class AgenteDirectorOptimizado(BaseAgent):
                         content_text = "".join(parts_text)
                 
                 content_text = content_text.strip()
-                if content_text:
-                    if autor not in respuestas_investigadores:
-                        respuestas_investigadores[autor] = []
-                    respuestas_investigadores[autor].append(content_text)
+                # Considerar vacío si no tiene caracteres legibles o si solo contiene comillas vacías
+                if content_text and content_text.replace('"', '').replace("'", "").strip():
+                    if autor not in respuestas_acumuladas:
+                        respuestas_acumuladas[autor] = []
+                    respuestas_acumuladas[autor].append(content_text)
 
-        # Consolidar respuestas
+        # 3. Consolidar respuestas y filtrar duplicados redundantes (ej. wrappers de agentes)
         respuestas_validas = {}
-        for autor, partes in respuestas_investigadores.items():
-            respuestas_validas[autor] = "\n".join(partes).strip()
+        for autor, partes in respuestas_acumuladas.items():
+            # Filtrar duplicados exactos
+            partes_unicas = []
+            for p in partes:
+                if p not in partes_unicas:
+                    partes_unicas.append(p)
+            
+            # Si hay un evento que representa el acumulado final (común en ADK), lo priorizamos
+            parte_mas_larga = max(partes_unicas, key=len, default="")
+            
+            # Si la parte más larga es sustancialmente el total, usamos esa directamente para evitar duplicar chunks redundantes
+            if parte_mas_larga and len(parte_mas_larga) >= sum(len(p) for p in partes_unicas) * 0.5:
+                respuestas_validas[autor] = parte_mas_larga
+            else:
+                respuestas_validas[autor] = "\n".join(partes_unicas).strip()
 
-        # Si no requiere acción (navegación o correo) y solo UN investigador tiene respuesta válida,
-        # hacemos bypass directo de la respuesta del investigador para ahorrar el LLM del Director.
+        # 4. Si no requiere acción y solo UN investigador tiene respuesta válida,
+        # hacemos bypass directo del LLM del director, simulando el streaming en el backend para la interfaz.
         if not requiere_accion and len(respuestas_validas) == 1:
             autor_unico = list(respuestas_validas.keys())[0]
-            yield crear_evento_texto("director_final", respuestas_validas[autor_unico])
+            texto_completo = respuestas_validas[autor_unico]
+            
+            # Simulamos el streaming segmentando el texto en pequeños fragmentos (chunks)
+            # de unas pocas palabras para lograr una animación visual de máquina de escribir fluida
+            import asyncio
+            palabras = texto_completo.split(" ")
+            chunk_size = 4  # Enviar de a 4 palabras
+            
+            for i in range(0, len(palabras), chunk_size):
+                chunk = " ".join(palabras[i : i + chunk_size])
+                if i + chunk_size < len(palabras):
+                    chunk += " "
+                yield crear_evento_texto("director_final", chunk, partial=True)
+                await asyncio.sleep(0.015)  # Micro-pausa de 15ms para un efecto de scroll natural
+            
+            # Yield final consolidated event so the turn completes beautifully with partial=None
+            yield crear_evento_texto("director_final", texto_completo, partial=None)
             return
 
         # --- FLUJO NORMAL: RUN LLM DIRECTOR ---
