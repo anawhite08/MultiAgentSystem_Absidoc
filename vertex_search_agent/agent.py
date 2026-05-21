@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, re, contextvars
 from dotenv import load_dotenv
 
 # Cargar variables de entorno del archivo .env local
@@ -34,6 +34,16 @@ GOOGLE_BD_DIRECCION = os.getenv("direccion")
 GOOGLE_BD_USER = os.getenv("userbd")
 GOOGLE_BD_PASSWORDBD = os.getenv("passwordbd")
 GOOGLE_BD_BD = os.getenv("bd")
+
+# --- VARIABLE DE CONTEXTO ASÍNCRONA PARA FILTRADO DE RAG ---
+id_version_filter_var = contextvars.ContextVar("id_version_filter", default=None)
+
+def extraer_ids_version(texto: str) -> list:
+    """Extrae cualquier ID de versión con formato [VERSION_ID: UUID] de un texto."""
+    if not texto:
+        return []
+    pattern = r"\[VERSION_ID:\s*([a-zA-Z0-9\-]+)\]"
+    return re.findall(pattern, texto, re.IGNORECASE)
 
 # --- CONEXIÓN SQL (lazy pool) ---
 db_connector = None
@@ -131,11 +141,20 @@ def vertex_ai_search(query: str) -> str:
             ),
         )
 
+        # Leer el filtro de ID de versión de ContextVar
+        ids_version = id_version_filter_var.get()
+        search_filter = None
+        if ids_version:
+            formatted_ids = ", ".join([f'"{id_}"' for id_ in ids_version])
+            search_filter = f"id: ANY({formatted_ids})"
+            print(f"[VERTEX_AI_SEARCH] Aplicando filtro de búsqueda por ID de versión: {search_filter}")
+
         request = discoveryengine.SearchRequest(
             serving_config=serving_config,
             query=query,
             page_size=5,
             content_search_spec=content_search_spec,
+            filter=search_filter,
         )
         response = client.search(request)
 
@@ -299,7 +318,14 @@ analista_sql = Agent(
     LISTAR DOCUMENTOS DE UN EXPEDIENTE:
     Al listar los documentos de un trabajador, diseña la consulta estructurada usando un `WITH RECURSIVE` para traer los hijos directos del `id_recurso` de su expediente, uniendo las tablas de versiones, estructura_organizativa, tipo_recurso, sub_etiqueta y etiqueta. Mapea los resultados leyendo las propiedades dinámicas de la metadata según lo dictado por la estructura del tipo de recurso.
 
-    IMPORTANTE: Si la pregunta del usuario es un saludo (ej. "Hola", "Buenos días") o no requiere base de datos, responde de inmediato con un texto vacío "" y delega el control.
+    RESOLUCIÓN CONDICIONAL DE DOCUMENTOS PARA FALLBACK:
+    1. Si la pregunta es sobre el contenido narrativo, cláusulas, políticas particulares, reglamentos o texto libre dentro de un documento de un empleado específico (ej. "qué dice la cláusula de confidencialidad del contrato de Peter Labrador" o "cuáles son las condiciones del acuerdo de Juan"):
+       - Primero, debes verificar si puedes responderla directamente con datos estructurados de las tablas.
+       - Si NO puedes responderla porque la respuesta reside en el texto del PDF, debes ejecutar una consulta SQL para encontrar el `id_version_activa` (de la tabla `recurso`) o `id_version` (de la tabla `version`) de ese documento específico para ese empleado.
+       - Una vez encontrado el ID, responde estrictamente incluyendo la etiqueta `[VERSION_ID: <id_version>]` en tu respuesta, acompañado de un mensaje indicando que localizaste el documento pero la consulta semántica detallada debe ser procesada por el especialista de documentos (ej. "Se localizó el contrato del empleado Peter Labrador [VERSION_ID: 9fae1554-469b-4395-8167-9c60e4b8df25], delego la lectura de cláusulas al RAG.").
+       - Si no encuentras ningún ID de versión para ese documento en SQL, no agregues la etiqueta y responde normalmente.
+
+    IMPORTANTE: Si la pregunta del usuario es un saludo (ej. "Hola", "Buenos días") o se refiere a políticas generales de la empresa (sin mencionar un empleado o documento específico), responde de inmediato con un texto vacío "" y delega el control. No intentes dar explicaciones de cortesía ni disculparte, pues eso evitaría que el sistema de fallback active el agente RAG.
     Responde en español. Sin asteriscos (*) en absoluto.
     """,
 )
@@ -385,12 +411,73 @@ SALUDOS_CHITCHAT = [
 ]
 
 
-class AgenteSQLCondicional(BaseAgent):
+def es_respuesta_vacia_o_sin_resultados(texto: str) -> bool:
     """
-    Agente condicional: solo invoca a analista_sql si la consulta no es un saludo vacío
-    y tiene indicios de requerir datos estructurados, o si es una consulta general.
+    Determina si la respuesta generada por el Analista SQL está vacía, indica error
+    o no arrojó ningún resultado en base de datos.
+    """
+    if not texto:
+        return True
+    
+    # Remover cualquier ocurrencia de etiquetas VERSION_ID para evaluar la respuesta real
+    texto_limpio = re.sub(r"\[VERSION_ID:\s*[a-zA-Z0-9\-]+\]", "", texto, flags=re.IGNORECASE)
+    
+    clean = texto_limpio.strip().lower()
+    clean = clean.replace('"', '').replace("'", "").strip()
+    
+    if not clean:
+        return True
+        
+    # Indicadores de ausencia de datos o errores en la base de datos
+    indicadores = [
+        "no se encontraron resultados",
+        "no se encontró",
+        "no se encontraron",
+        "no tengo información",
+        "no tengo informacion",
+        "no hay información",
+        "no hay informacion",
+        "no se registra",
+        "no existe",
+        "error en sql",
+        "error de sql",
+        "[]",
+        "null",
+        "ningún resultado",
+        "ningun resultado",
+        "no tengo acceso",
+        "lo siento",
+        "mi función",
+        "mi funcion",
+        "no está en la base",
+        "no esta en la base",
+        "no tengo registros",
+        "no se registran",
+        "no tengo info"
+    ]
+    
+    for ind in indicadores:
+        if ind in clean:
+            return True
+            
+    # Si es extremadamente corto, probablemente es un valor de descarte
+    if len(clean) < 5:
+        return True
+        
+    return False
+
+
+class AgenteInvestigacionSecuencial(BaseAgent):
+    """
+    Agente de investigación secuencial inteligente con fallback:
+    1. Siempre ejecuta analista_sql primero (self.sub_agents[0]).
+    2. Si analista_sql no obtiene resultados o da un mensaje de "no se encontraron resultados"
+       (comprobado por es_respuesta_vacia_o_sin_resultados), ejecuta documental_rag (self.sub_agents[1]).
     """
     async def _run_async_impl(self, ctx) -> AsyncGenerator:
+        # Resetear el filtro de id_version al inicio de cada turno de investigación
+        id_version_filter_var.set(None)
+
         mensaje_usuario = ""
         for event in reversed(ctx.session.events):
             if event.author == "user" and event.content and event.content.parts:
@@ -403,76 +490,44 @@ class AgenteSQLCondicional(BaseAgent):
 
         msg_lower = mensaje_usuario.lower().strip()
         
-        # Si es un saludo simple o chitchat de palabras cortas, hacemos skip silencioso
+        # Si es un saludo simple o chitchat de palabras cortas, hacemos skip silencioso de la investigación
         if msg_lower in SALUDOS_CHITCHAT or len(msg_lower) < 3:
             yield crear_evento_texto(self.name, "")
             return
 
-        # Si explícitamente tiene keywords de RAG pero NO de SQL, hacemos skip de SQL
-        tiene_sql = any(kw in msg_lower for kw in KEYWORDS_SQL)
-        tiene_rag = any(kw in msg_lower for kw in KEYWORDS_RAG)
-        
-        if tiene_rag and not tiene_sql:
-            yield crear_evento_texto(self.name, "")
-            return
-
-        async for event in self.sub_agents[0].run_async(ctx):
+        # 1. Siempre ejecutar analista_sql primero (self.sub_agents[0])
+        sql_text = ""
+        analista = self.sub_agents[0]
+        async for event in analista.run_async(ctx):
             yield event
+            autor = getattr(event, "author", "")
+            if autor == analista.name:
+                content_obj = getattr(event, "content", None)
+                if content_obj:
+                    if isinstance(content_obj, str):
+                        sql_text += content_obj
+                    elif hasattr(content_obj, "parts") and content_obj.parts:
+                        for part in content_obj.parts:
+                            if hasattr(part, "text") and part.text:
+                                sql_text += part.text
+
+        # Extraer cualquier ID de versión detectado de la respuesta de SQL
+        ids_version = extraer_ids_version(sql_text)
+        if ids_version:
+            id_version_filter_var.set(ids_version)
+            print(f"[AgenteInvestigacionSecuencial] Se extrajeron IDs de versión desde SQL: {ids_version}")
+
+        # 2. Si no se consiguieron resultados de SQL, ejecutar el documental_rag (self.sub_agents[1]) de fallback
+        if es_respuesta_vacia_o_sin_resultados(sql_text):
+            rag = self.sub_agents[1]
+            async for event in rag.run_async(ctx):
+                yield event
 
 
-class AgenteRAGCondicional(BaseAgent):
-    """
-    Agente condicional: solo invoca a documental_rag si la consulta no es un saludo vacío
-    y tiene indicios de requerir información documental, o si es una consulta general.
-    """
-    async def _run_async_impl(self, ctx) -> AsyncGenerator:
-        mensaje_usuario = ""
-        for event in reversed(ctx.session.events):
-            if event.author == "user" and event.content and event.content.parts:
-                for part in event.content.parts:
-                    if hasattr(part, "text") and part.text:
-                        mensaje_usuario = part.text
-                        break
-            if mensaje_usuario:
-                break
-
-        msg_lower = mensaje_usuario.lower().strip()
-        
-        # Si es un saludo simple o chitchat de palabras cortas, hacemos skip silencioso
-        if msg_lower in SALUDOS_CHITCHAT or len(msg_lower) < 3:
-            yield crear_evento_texto(self.name, "")
-            return
-
-        # Si explícitamente tiene keywords de SQL pero NO de RAG, hacemos skip de RAG
-        tiene_sql = any(kw in msg_lower for kw in KEYWORDS_SQL)
-        tiene_rag = any(kw in msg_lower for kw in KEYWORDS_RAG)
-        
-        if tiene_sql and not tiene_rag:
-            yield crear_evento_texto(self.name, "")
-            return
-
-        async for event in self.sub_agents[0].run_async(ctx):
-            yield event
-
-
-# Instanciación de investigadores condicionales
-analista_sql_condicional = AgenteSQLCondicional(
-    name="analista_sql_condicional", sub_agents=[analista_sql]
-)
-
-documental_rag_condicional = AgenteRAGCondicional(
-    name="documental_rag_condicional", sub_agents=[documental_rag]
-)
-
-
-# =============================================================================
-# AGRUPACIÓN EN PARALELO: ANALISTA + RAG (CON CONDICIONALES RÁPIDOS)
-# Ambos agentes siempre trabajan juntos en paralelo, optimizados con validación por código.
-# =============================================================================
-investigadores_rrhh = ParallelAgent(
+# Instanciación de la investigación secuencial inteligente
+investigadores_rrhh = AgenteInvestigacionSecuencial(
     name="investigadores_rrhh",
-    sub_agents=[analista_sql_condicional, documental_rag_condicional],
-    description="Analista SQL y Documental RAG condicionales trabajando en paralelo.",
+    sub_agents=[analista_sql, documental_rag],
 )
 
 
@@ -505,11 +560,11 @@ buscador_web_condicional = AgenteBuscadorCondicional(
 orquestador = ParallelAgent(
     name="orquestador",
     sub_agents=[investigadores_rrhh, buscador_web_condicional],
-    description="Orquestador que ejecuta la búsqueda en RRHH y (opcionalmente) la web en paralelo.",
+    description="Orquestador que ejecuta la búsqueda secuencial en RRHH y (opcionalmente) la web en paralelo.",
 )
 
 # =============================================================================
-# SUB-AGENTE FINAL: DIRECTOR (OPTIMIZADO)
+# SUB-AGENTE FINAL: DIRECTOR (OPTIMIZADO CON CONSOLIDACIÓN)
 # =============================================================================
 director_final = Agent(
     name="director_final",
@@ -520,7 +575,11 @@ director_final = Agent(
 
     TUS RESPONSABILIDADES CRÍTICAS:
     1. Manejo de Saludos (Chitchat): Si el usuario te saluda ("Hola", "Buenos días"), sé cortés, responde de manera ejecutiva y pregúntale en qué puedes ayudarle. No busques IDs ni intentes procesar datos en este escenario.
-    2. Priorización Absoluta: El Analista SQL es tu fuente de la verdad para datos estructurados y listas de documentos. Si el Analista SQL devuelve datos válidos, PRIORIZA esa respuesta. Usa los datos del RAG únicamente si complementan el contenido interno de un documento. [cite: 108, 109, 110]
+    2. Priorización y Consolidación Inteligente (REGLA DE ORO):
+       - El Analista SQL es tu fuente de la verdad para datos estructurados de la base de datos (vacaciones, cumpleaños, expedientes, listas de documentos, etc.).
+       - El Documental RAG es tu fuente de la verdad para políticas, cláusulas, contratos y textos de PDFs.
+       - Si ambos agentes devuelven respuestas válidas, debes utilizarlas, consolidarlas o hacer match de ambas de forma inteligente si es necesario. Por ejemplo, si el Analista SQL te da la fecha de ingreso o los días de vacaciones de un trabajador, y el RAG te da la política general de vacaciones, unifica ambas informaciones para darle al usuario una respuesta completa y personalizada.
+       - Si el Analista SQL no obtuvo resultados (o dio un error) y se ejecutó el RAG, utiliza y prioriza la respuesta del RAG.
     3. Lógica de Navegación (REGLAS DE ID ESTRICTAS):
        Si el usuario usa verbos de acción como "búscame", "busca", "ubícame", "encuentra", "abre", "navega" o "consigue", ejecuta INMEDIATAMENTE la herramienta `navegar_software` pasando los siguientes parámetros de forma rigurosa:
        - CASO A (Expediente o Carpeta Raíz del Trabajador): Si te piden abrir/ubicar el expediente de un trabajador (ej. "Abre el expediente de Ana Blanco"), debes pasar el ID del expediente (su 'id_recurso' con tipo de recurso de expediente '36e88186-f873-40cd-a1eb-f4bc3dd18af1') en AMBOS parámetros de la herramienta. Es decir, tanto id_trabajador como id_documento deben tener exactamente el mismo valor (el id_recurso del expediente).
@@ -548,6 +607,7 @@ director_final = Agent(
     FORMATO GENERAL:
     - Responde siempre en español de forma ejecutiva, clara y concisa. 
     - Queda estrictamente PROHIBIDO el uso de asteriscos (*) bajo cualquier circunstancia en tus respuestas. No utilices negritas de markdown (no uses '**' ni '*'). Si necesitas dar énfasis o destacar títulos/secciones, escríbelas en MAYÚSCULAS o simplemente como texto normal sin símbolos adicionales. Tampoco uses asteriscos para viñetas (usa guiones medios '-' o numeración).
+    - Queda absolutamente PROHIBIDO mostrar cualquier etiqueta de metadatos interna como `[VERSION_ID: ...]` en tu respuesta final al usuario. Esas etiquetas son de uso interno exclusivo del sistema de fallback.
     - Identifica al trabajador por su nombre/título. 
     """,
 )
@@ -644,7 +704,7 @@ class AgenteDirectorOptimizado(BaseAgent):
                         respuestas_acumuladas[autor] = []
                     respuestas_acumuladas[autor].append(content_text)
 
-        # 3. Consolidar respuestas y filtrar duplicados redundantes (ej. wrappers de agentes)
+        # 3. Consolidar respuestas, aplicando filtro de respuestas sin resultados
         respuestas_validas = {}
         for autor, partes in respuestas_acumuladas.items():
             # Filtrar duplicados exactos
@@ -653,14 +713,15 @@ class AgenteDirectorOptimizado(BaseAgent):
                 if p not in partes_unicas:
                     partes_unicas.append(p)
             
-            # Si hay un evento que representa el acumulado final (común en ADK), lo priorizamos
-            parte_mas_larga = max(partes_unicas, key=len, default="")
+            # Simplificado: Unimos todas las partes únicas con un salto de línea
+            texto_consolidado = "\n".join(partes_unicas).strip()
             
-            # Si la parte más larga es sustancialmente el total, usamos esa directamente para evitar duplicar chunks redundantes
-            if parte_mas_larga and len(parte_mas_larga) >= sum(len(p) for p in partes_unicas) * 0.5:
-                respuestas_validas[autor] = parte_mas_larga
-            else:
-                respuestas_validas[autor] = "\n".join(partes_unicas).strip()
+            # Limpiar de forma definitiva las etiquetas VERSION_ID de la respuesta antes de evaluarla o presentarla
+            texto_consolidado = re.sub(r"\[VERSION_ID:\s*[a-zA-Z0-9\-]+\]", "", texto_consolidado, flags=re.IGNORECASE).strip()
+                
+            # Filtro inteligente: solo registrar respuesta en respuestas_validas si tiene contenido relevante
+            if not es_respuesta_vacia_o_sin_resultados(texto_consolidado):
+                respuestas_validas[autor] = texto_consolidado
 
         # 4. Si no requiere acción y solo UN investigador tiene respuesta válida,
         # hacemos bypass directo del LLM del director, simulando el streaming en el backend para la interfaz.
@@ -687,6 +748,14 @@ class AgenteDirectorOptimizado(BaseAgent):
 
         # --- FLUJO NORMAL: RUN LLM DIRECTOR ---
         async for event in self.sub_agents[0].run_async(ctx):
+            autor = getattr(event, "author", "")
+            if autor == "director_final":
+                # Interceptar y limpiar cualquier residuo de etiqueta VERSION_ID en las respuestas del director
+                content_obj = getattr(event, "content", None)
+                if content_obj and hasattr(content_obj, "parts") and content_obj.parts:
+                    for part in content_obj.parts:
+                        if hasattr(part, "text") and part.text:
+                            part.text = re.sub(r"\[VERSION_ID:\s*[a-zA-Z0-9\-]+\]", "", part.text, flags=re.IGNORECASE)
             yield event
 
 
@@ -701,5 +770,5 @@ director_final_optimizado = AgenteDirectorOptimizado(
 root_agent = SequentialAgent(
     name="vertex_search_agent",
     sub_agents=[orquestador, director_final_optimizado],
-    description="Orquestador inteligente que enruta en paralelo y luego sintetiza a través del director optimizado.",
+    description="Orquestador inteligente que enruta secuencialmente y luego sintetiza a través del director optimizado.",
 )
