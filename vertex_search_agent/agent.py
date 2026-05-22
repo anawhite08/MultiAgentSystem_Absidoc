@@ -341,7 +341,7 @@ documental_rag = Agent(
     Eres el Especialista en Documentos de RRHH. Tu única responsabilidad es buscar información dentro del texto contenido en los PDFs y expedientes digitalizados. [cite: 84, 85]
 
     REGLAS DE CONVIVENCIA CON EL ANALISTA:
-    1. Si el usuario te pide "listar los documentos de un trabajador", "buscar fechas de ingreso" o "saber datos personales", NO uses la herramienta de búsqueda ni inventes datos. Responde con un resumen completamente vacío "" para que el Analista SQL (que tiene el esquema real) tome el control de la respuesta estructurada. [cite: 86, 88, 89]
+    1. Si el usuario te pide "listar los documentos de un trabajador", "buscar fechas de ingreso", NO uses la herramienta de búsqueda ni inventes datos. Responde con un resumen completamente vacío "" para que el Analista SQL (que tiene el esquema real) tome el control de la respuesta estructurada. [cite: 86, 88, 89]
     2. Utiliza `vertex_ai_search` ÚNICAMENTE cuando pregunten por políticas internas, el contenido de texto de una cláusula, certificaciones o detalles narrativos dentro de los documentos. [cite: 87, 90]
 
     CÓMO INTERPRETAR LOS RESULTADOS:
@@ -615,6 +615,155 @@ director_final = Agent(
 # =============================================================================
 # DIRECTOR OPTIMIZADO POR CÓDIGO
 # =============================================================================
+# class AgenteDirectorOptimizado(BaseAgent):
+#     """
+#     Director final de RRHH de Abside, optimizado con:
+#     1. Intercepción y respuesta ultra-rápida (0.01s) para saludos y chitchat básico por código.
+#     2. Atajo (Bypass) del LLM si el orquestador ya produjo la respuesta de un investigador único
+#        y no se requiere ejecutar herramientas (navegar o enviar correo). Esto ahorra un LLM completo (~1.5s).
+#     """
+
+#     async def _run_async_impl(self, ctx) -> AsyncGenerator:
+#         # 1. Obtener el último mensaje del usuario
+#         mensaje_usuario = ""
+#         for event in reversed(ctx.session.events):
+#             if event.author == "user" and event.content and event.content.parts:
+#                 for part in event.content.parts:
+#                     if hasattr(part, "text") and part.text:
+#                         mensaje_usuario = part.text
+#                         break
+#             if mensaje_usuario:
+#                 break
+
+#         msg_lower = mensaje_usuario.lower().strip()
+
+#         # --- OPTIMIZACIÓN A: RESPUESTA ESTÁTICA PARA SALUDOS (0.01s) ---
+#         saludos_directos = {
+#             "hola": "¡Hola! Soy tu asistente de RRHH de Abside. ¿En qué te puedo colaborar el día de hoy? 😊",
+#             "buenos días": "¡Buenos días! Espero que estés excelente hoy. ¿En qué te puedo colaborar? ☀️",
+#             "buenos dias": "¡Buenos días! Espero que estés excelente hoy. ¿En qué te puedo colaborar? ☀️",
+#             "buenas tardes": "¡Buenas tardes! ¿En qué te puedo ayudar o colaborar el día de hoy? ☕",
+#             "buenas noches": "¡Buenas noches! ¿En qué te puedo colaborar antes de terminar el día? 🌙",
+#             "gracias": "¡Con muchísimo gusto! Quedo a tu entera disposición si necesitas consultar algo más sobre expedientes, vacaciones o políticas de RRHH. ¡Que tengas un excelente día! 👍",
+#             "gracias!": "¡Con muchísimo gusto! Quedo a tu entera disposición si necesitas consultar algo más sobre expedientes, vacaciones o políticas de RRHH. ¡Que tengas un excelente día! 👍",
+#             "muchas gracias": "¡Con muchísimo gusto! Quedo a tu entera disposición si necesitas consultar algo más sobre expedientes, vacaciones o políticas de RRHH. ¡Que tengas un excelente día! 👍",
+#             "ok": "¡Excelente! Quedo atento a cualquier otra consulta que desees realizar. ¡Que tengas un buen día! 👍",
+#             "listo": "¡Perfecto! Quedo atento si necesitas algo más. ¡Que tengas un excelente día! 👍",
+#             "adiós": "¡Hasta luego! Que tengas un excelente día. Estaré aquí cuando me necesites. ¡Hasta pronto! 👋",
+#             "adios": "¡Hasta luego! Que tengas un excelente día. Estaré aquí cuando me necesites. ¡Hasta pronto! 👋",
+#             "chao": "¡Hasta luego! Que tengas un excelente día. Estaré aquí cuando me necesites. ¡Hasta pronto! 👋"
+#         }
+
+#         if msg_lower in saludos_directos:
+#             yield crear_evento_texto("director_final", saludos_directos[msg_lower])
+#             return
+
+#         if msg_lower in SALUDOS_CHITCHAT:
+#             yield crear_evento_texto("director_final", "¡Hola! Soy tu asistente de RRHH de Abside. ¿En qué te puedo colaborar el día de hoy? 😊")
+#             return
+
+#         # --- OPTIMIZACIÓN B: BYPASS INTELIGENTE DEL LLM DEL DIRECTOR ---
+#         # Si un investigador ya devolvió una respuesta válida, y no se requiere ejecutar herramientas de acción del director
+#         # (como navegar en el software o enviar correo), podemos entregar directamente la respuesta del investigador.
+#         # Esto reduce 1 llamada secuencial de LLM, ahorrando entre 1.5 y 2.5 segundos.
+        
+#         # Palabras clave de acción que requieren la ejecución de herramientas del Director
+#         KEYWORDS_ACCION = ["busca", "búscame", "ubica", "ubícame", "encuentra", "abre", "consigue", "enviar", "envía", "enviame", "envíame", "correo", "email", "gmail"]
+#         requiere_accion = any(kw in msg_lower for kw in KEYWORDS_ACCION)
+
+#         # 1. Encontrar el índice del último mensaje del usuario para aislar el turno actual
+#         user_event_index = -1
+#         for i, event in enumerate(ctx.session.events):
+#             if getattr(event, "author", "") == "user":
+#                 user_event_index = i
+
+#         # 2. Buscar las respuestas de los investigadores en los eventos únicamente de este turno actual
+#         respuestas_acumuladas = {}
+#         events_to_scan = ctx.session.events[user_event_index + 1 :] if user_event_index != -1 else ctx.session.events
+
+#         for event in events_to_scan:
+#             autor = getattr(event, "author", "")
+#             if autor in ["analista_sql", "documental_rag", "buscador_web"]:
+#                 # Obtener el texto del contenido de forma robusta
+#                 content_text = ""
+#                 content_obj = getattr(event, "content", None)
+#                 if content_obj:
+#                     if isinstance(content_obj, str):
+#                         content_text = content_obj
+#                     elif hasattr(content_obj, "parts") and content_obj.parts:
+#                         parts_text = []
+#                         for part in content_obj.parts:
+#                             if hasattr(part, "text") and part.text:
+#                                 parts_text.append(part.text)
+#                         content_text = "".join(parts_text)
+                
+#                 content_text = content_text.strip()
+#                 # Considerar vacío si no tiene caracteres legibles o si solo contiene comillas vacías
+#                 if content_text and content_text.replace('"', '').replace("'", "").strip():
+#                     if autor not in respuestas_acumuladas:
+#                         respuestas_acumuladas[autor] = []
+#                     respuestas_acumuladas[autor].append(content_text)
+
+#         # 3. Consolidar respuestas, aplicando filtro de respuestas sin resultados
+#         respuestas_validas = {}
+#         for autor, partes in respuestas_acumuladas.items():
+#             # Filtrar duplicados exactos
+#             partes_unicas = []
+#             for p in partes:
+#                 if p not in partes_unicas:
+#                     partes_unicas.append(p)
+            
+#             # Simplificado: Unimos todas las partes únicas con un salto de línea
+#             texto_consolidado = "\n".join(partes_unicas).strip()
+            
+#             # Limpiar de forma definitiva las etiquetas VERSION_ID de la respuesta antes de evaluarla o presentarla
+#             texto_consolidado = re.sub(r"\[VERSION_ID:\s*[a-zA-Z0-9\-]+\]", "", texto_consolidado, flags=re.IGNORECASE).strip()
+                
+#             # Filtro inteligente: solo registrar respuesta en respuestas_validas si tiene contenido relevante
+#             if not es_respuesta_vacia_o_sin_resultados(texto_consolidado):
+#                 respuestas_validas[autor] = texto_consolidado
+
+#         # 4. Si no requiere acción y solo UN investigador tiene respuesta válida,
+#         # hacemos bypass directo del LLM del director, simulando el streaming en el backend para la interfaz.
+#         if not requiere_accion and len(respuestas_validas) == 1:
+#             autor_unico = list(respuestas_validas.keys())[0]
+#             texto_completo = respuestas_validas[autor_unico]
+            
+#             # Simulamos el streaming segmentando el texto en pequeños fragmentos (chunks)
+#             # de unas pocas palabras para lograr una animación visual de máquina de escribir fluida
+#             import asyncio
+#             palabras = texto_completo.split(" ")
+#             chunk_size = 4  # Enviar de a 4 palabras
+            
+#             for i in range(0, len(palabras), chunk_size):
+#                 chunk = " ".join(palabras[i : i + chunk_size])
+#                 if i + chunk_size < len(palabras):
+#                     chunk += " "
+#                 yield crear_evento_texto("director_final", chunk, partial=True)
+#                 await asyncio.sleep(0.015)  # Micro-pausa de 15ms para un efecto de scroll natural
+            
+#             # Yield final consolidated event so the turn completes beautifully with partial=None
+#             yield crear_evento_texto("director_final", texto_completo, partial=None)
+#             return
+
+#         # --- FLUJO NORMAL: RUN LLM DIRECTOR ---
+#         async for event in self.sub_agents[0].run_async(ctx):
+#             autor = getattr(event, "author", "")
+#             if autor == "director_final":
+#                 # Interceptar y limpiar cualquier residuo de etiqueta VERSION_ID en las respuestas del director
+#                 content_obj = getattr(event, "content", None)
+#                 if content_obj and hasattr(content_obj, "parts") and content_obj.parts:
+#                     for part in content_obj.parts:
+#                         if hasattr(part, "text") and part.text:
+#                             part.text = re.sub(r"\[VERSION_ID:\s*[a-zA-Z0-9\-]+\]", "", part.text, flags=re.IGNORECASE)
+#             yield event
+
+
+# director_final_optimizado = AgenteDirectorOptimizado(
+#     name="director_final_optimizado",
+#     sub_agents=[director_final]
+# )
+
 class AgenteDirectorOptimizado(BaseAgent):
     """
     Director final de RRHH de Abside, optimizado con:
@@ -747,15 +896,8 @@ class AgenteDirectorOptimizado(BaseAgent):
             return
 
         # --- FLUJO NORMAL: RUN LLM DIRECTOR ---
+        # Se ha eliminado el regex bloqueador para permitir el flujo asíncrono y streaming real.
         async for event in self.sub_agents[0].run_async(ctx):
-            autor = getattr(event, "author", "")
-            if autor == "director_final":
-                # Interceptar y limpiar cualquier residuo de etiqueta VERSION_ID en las respuestas del director
-                content_obj = getattr(event, "content", None)
-                if content_obj and hasattr(content_obj, "parts") and content_obj.parts:
-                    for part in content_obj.parts:
-                        if hasattr(part, "text") and part.text:
-                            part.text = re.sub(r"\[VERSION_ID:\s*[a-zA-Z0-9\-]+\]", "", part.text, flags=re.IGNORECASE)
             yield event
 
 
@@ -763,6 +905,7 @@ director_final_optimizado = AgenteDirectorOptimizado(
     name="director_final_optimizado",
     sub_agents=[director_final]
 )
+
 
 # =============================================================================
 # AGENTE PRINCIPAL (root_agent)
