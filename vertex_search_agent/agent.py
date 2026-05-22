@@ -325,6 +325,10 @@ analista_sql = Agent(
        - Una vez encontrado el ID, responde estrictamente incluyendo la etiqueta `[VERSION_ID: <id_version>]` en tu respuesta, acompañado de un mensaje indicando que localizaste el documento pero la consulta semántica detallada debe ser procesada por el especialista de documentos (ej. "Se localizó el contrato del empleado Peter Labrador [VERSION_ID: 9fae1554-469b-4395-8167-9c60e4b8df25], delego la lectura de cláusulas al RAG.").
        - Si no encuentras ningún ID de versión para ese documento en SQL, no agregues la etiqueta y responde normalmente.
 
+    REGLA DE LISTADO COMPLETO (CRÍTICA):
+    - Cuando ejecutes una consulta SQL que arroje múltiples registros o resultados (por ejemplo, personas con documentos vencidos, cumpleaños de trabajadores, listados de contratos, etc.), debes listar y reportar TODOS los registros devueltos por la base de datos en tu respuesta final.
+    - Queda estrictamente PROHIBIDO truncar la lista de resultados o limitar la respuesta de forma arbitraria a un número pequeño de registros (como solo mostrar 3 resultados), a menos que el usuario lo haya solicitado de forma explícita en su mensaje (ej. 'muestra los 3 primeros').
+
     IMPORTANTE: Si la pregunta del usuario es un saludo (ej. "Hola", "Buenos días") o se refiere a políticas generales de la empresa (sin mencionar un empleado o documento específico), responde de inmediato con un texto vacío "" y delega el control. No intentes dar explicaciones de cortesía ni disculparte, pues eso evitaría que el sistema de fallback active el agente RAG.
     Responde en español. Sin asteriscos (*) en absoluto.
     """,
@@ -605,7 +609,9 @@ director_final = Agent(
     - PASO 2 (Envío): Únicamente si el usuario responde de manera afirmativa ("sí", "confirmo", "enviar", "ok") al borrador previo, procede a llamar a la herramienta `enviar_correo`. 
 
     FORMATO GENERAL:
-    - Responde siempre en español de forma ejecutiva, clara y concisa. 
+    - Responde siempre en español de forma ejecutiva y clara.
+    - REGLA DE LISTADO COMPLETO (CRÍTICA): Cuando el Analista SQL o los investigadores reporten múltiples registros o resultados (como un listado de trabajadores, personas con documentos vencidos, cumpleaños, etc.), estás obligado a incluir y listar TODOS y cada uno de los elementos reportados en tu respuesta final. Queda estrictamente PROHIBIDO truncar, resumir o limitar la lista de resultados de forma arbitraria a un número pequeño de registros (como solo mostrar 3 resultados), a menos que el usuario lo haya solicitado de forma explícita en su mensaje actual.
+    - REGLA DE TURNO ACTUAL (CRÍTICA): Debes responder ÚNICAMENTE basándote en la consulta del usuario en el turno actual y en los resultados arrojados por los investigadores para este turno específico. Queda estrictamente PROHIBIDO mezclar, repetir, heredar o arrastrar resultados de listados o consultas de turnos anteriores (por ejemplo, si el usuario antes preguntó por "cédulas vencidas" y ahora pregunta por "abrir el expediente de Juan", NO debes incluir en tu respuesta actual la lista de cédulas vencidas ni mezclar información de turnos previos, responde únicamente a la solicitud actual).
     - Queda estrictamente PROHIBIDO el uso de asteriscos (*) bajo cualquier circunstancia en tus respuestas. No utilices negritas de markdown (no uses '**' ni '*'). Si necesitas dar énfasis o destacar títulos/secciones, escríbelas en MAYÚSCULAS o simplemente como texto normal sin símbolos adicionales. Tampoco uses asteriscos para viñetas (usa guiones medios '-' o numeración).
     - Queda absolutamente PROHIBIDO mostrar cualquier etiqueta de metadatos interna como `[VERSION_ID: ...]` en tu respuesta final al usuario. Esas etiquetas son de uso interno exclusivo del sistema de fallback.
     - Identifica al trabajador por su nombre/título. 
