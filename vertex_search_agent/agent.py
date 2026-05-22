@@ -265,7 +265,7 @@ analista_sql = Agent(
     ESQUEMA DE TABLAS DISPONIBLE:
     - recurso (id_recurso, titulo, id_recurso_padre, id_version_activa, id_tipo_recurso, estado)
     - version (id_version, fecha_vencimiento, metadata, id_recurso, resumen, fecha_creacion)
-    - tipo_recurso (id_tipo_recurso, estructura, nombre, descripcion)
+    - tipo_recurso (id_tipo_recurso, estructura, nombre, descripcion) #Los tipos de recursos te dicen que documento estas tratando, si usas el campo 'nombre' puedes sabes si es una cedula, un pasaporte, un expediente, lo que sea, usalo para identificar que documento es
     - catalogo_tipos_expediente (id_tipo_expediente, nombre_tipo)
     - requisitos_expediente (id_tipo_expediente, id_tipo_recurso_obligatorio, obligatorio)
 
