@@ -1,5 +1,7 @@
 import sys, os, re, contextvars
 from dotenv import load_dotenv
+from vertexai.preview import rag # (o 'from vertexai import rag' si tu SDK está muy actualizado)
+from vertexai.generative_models import Tool
 
 # Cargar variables de entorno del archivo .env local
 load_dotenv()
@@ -11,6 +13,7 @@ from google.adk.events import Event
 from google.genai.types import Content, Part
 from google.adk.tools import google_search
 from typing import AsyncGenerator
+from .__init__ import GOOGLE_CLOUD_PROJECT,GESTOR_API_BASE_URL, GOOGLE_CLOUD_LOCATION, GOOGLE_ENGINE_ID,GOOGLE_CORPUS_ID,GOOGLE_BD_DIRECCION,GOOGLE_BD_USER,GOOGLE_BD_PASSWORDBD ,GOOGLE_BD_BD 
 
 
 # --- HELPER DE EVENTOS ADK ---
@@ -23,17 +26,6 @@ def crear_evento_texto(autor: str, texto: str, partial: bool = None) -> Event:
 from google.cloud import discoveryengine_v1 as discoveryengine
 from google.cloud.sql.connector import Connector, IPTypes
 
-
-# --- VARIABLES DE ENTORNO ---
-GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
-GESTOR_API_BASE_URL = os.getenv("GESTOR_API_BASE_URL")
-GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-GOOGLE_ENGINE_ID = os.getenv("GOOGLE_ENGINE_ID")
-
-GOOGLE_BD_DIRECCION = os.getenv("direccion")
-GOOGLE_BD_USER = os.getenv("userbd")
-GOOGLE_BD_PASSWORDBD = os.getenv("passwordbd")
-GOOGLE_BD_BD = os.getenv("bd")
 
 # --- VARIABLE DE CONTEXTO ASÍNCRONA PARA FILTRADO DE RAG ---
 id_version_filter_var = contextvars.ContextVar("id_version_filter", default=None)
@@ -103,6 +95,36 @@ def ejecutar_consulta_sql_dinamica(query: str) -> str:
 
 # --- CLIENTE VERTEX AI SEARCH (lazy loader) ---
 vertex_search_client = None
+
+def consultar_documentos_rrhh(consulta: str) -> str:
+    """
+    Busca información específica en los expedientes, políticas y PDFs de los trabajadores.
+    Debe recibir la pregunta o los términos de búsqueda detallados.
+    """
+    try:
+        corpus_name = f"projects/{GOOGLE_CLOUD_PROJECT}/locations/{GOOGLE_CLOUD_LOCATION}/ragCorpora/{GOOGLE_CORPUS_ID}"
+        
+        # Consultamos el RAG manualmente usando retrieval_query
+        response = rag.retrieval_query(
+            text=consulta,
+            rag_resources=[rag.RagResource(rag_corpus=corpus_name)],
+            similarity_top_k=5 # Devuelve los 5 mejores fragmentos
+        )
+        
+        if not response or not getattr(response, "contexts", None) or not response.contexts.contexts:
+            return "No se encontró información relevante en los documentos de RRHH para esta consulta."
+            
+        fragmentos = []
+        for ctx in response.contexts.contexts:
+            # Extraemos el nombre del archivo y el texto del fragmento
+            origen = getattr(ctx, "source_uri", "Documento desconocido")
+            texto = getattr(ctx, "text", "")
+            fragmentos.append(f"--- ARCHIVO: {origen} ---\n{texto}")
+            
+        return "\n\n".join(fragmentos)
+    except Exception as e:
+        return f"Error al buscar en el corpus documental: {str(e)}"
+    
 
 
 def get_vertex_search_client():
@@ -363,19 +385,30 @@ analista_sql = Agent(
 documental_rag = Agent(
     name="documental_rag",
     model="gemini-2.5-pro",  # Cambiado a Pro para mejor interpretación de PDFs y políticas de RRHH
-    tools=[vertex_ai_search],
+    tools=[consultar_documentos_rrhh],
     instruction="""
-    Eres el Especialista en Documentos de RRHH. Tu única responsabilidad es buscar información dentro del texto contenido en los PDFs y expedientes digitalizados. [cite: 84, 85]
+    Eres el Especialista en Documentos de RRHH. Tienes acceso a una base de conocimiento que contiene expedientes digitalizados y PDFs de múltiples trabajadores de la empresa. Tu única responsabilidad es buscar información dentro de este texto no estructurado usando la herramienta consultar_documentos_rrhh de manera exclusiva.
 
-    REGLAS DE CONVIVENCIA CON EL ANALISTA:
-    1. Si el usuario te pide "listar los documentos de un trabajador", "buscar fechas de ingreso", NO uses la herramienta de búsqueda ni inventes datos. Responde con un resumen completamente vacío "" para que el Analista SQL (que tiene el esquema real) tome el control de la respuesta estructurada. [cite: 86, 88, 89]
-    2. Utiliza `vertex_ai_search` ÚNICAMENTE cuando pregunten por políticas internas, el contenido de texto de una cláusula, certificaciones o detalles narrativos dentro de los documentos. [cite: 87, 90]
+    REGLA DE HERRAMIENTAS EXCLUSIVA:
+    La unica herramienta de busqueda que tienes disponible es consultar_documentos_rrhh. Queda totalmente PROHIBIDO inventar nombres de herramientas o usar variaciones en ingles como consultar_documents_rrhh o similar. Usa siempre consultar_documentos_rrhh de manera exacta.
 
-    CÓMO INTERPRETAR LOS RESULTADOS:
-    - Prioriza siempre la sección 'RESUMEN SEMÁNTICO'. [cite: 91]
-    - Usa 'DOCUMENTOS RELEVANTES' sólo para extraer el ID_Documento ('id_version') si se requiere realizar una navegación directa. [cite: 91]
+    REGLA CRITICA DE EJECUCION DE CODIGO:
+    Queda totalmente PROHIBIDO y terminantemente denegada la ejecucion de cualquier codigo Python, sandboxes de programacion, o llamadas a herramientas de ejecucion de codigo como code_execution/code_output o similar. Todo tu analisis debe ser entregado en lenguaje natural en espanol.
 
-    Responde en español. Sin asteriscos (*). [cite: 92]
+    REGLAS PARA IDENTIFICAR AL TRABAJADOR:
+    1. Cuando se te pregunte por un trabajador específico, tu consulta en la herramienta de búsqueda DEBE incluir siempre el nombre, apellido o identificador del trabajador.
+    2. Al recibir los documentos recuperados, verifica estrictamente que el texto pertenezca al trabajador solicitado antes de emitir tu respuesta. Si el fragmento habla de otra persona, debes asumir que no tienes la información y responder que no se encontraron datos en el expediente de ese trabajador en particular.
+
+    REGLAS DE CONVIVENCIA CON EL ANALISTA SQL:
+    1. Si el usuario te pide listar los documentos de un trabajador o buscar datos exactos como fechas de ingreso, salarios base o IDs, NO inventes datos. Si la consulta es EXCLUSIVAMENTE sobre estos datos estructurados de base de datos y no requiere ninguna búsqueda en documentos o políticas, responde únicamente con un texto vacío "" para no interferir.
+    2. Si la consulta es MIXTA (ej. "días de vacaciones de Ana y qué dice la política") o contiene solicitudes sobre políticas, cláusulas, certificaciones, desempeño o información de texto dentro de los documentos, DEBES ejecutar tu herramienta de búsqueda semántica y responder con la información del texto encontrada. No te quedes callado por el hecho de que se mencione a un empleado o datos de SQL; ambos agentes operan en paralelo y sus respuestas serán consolidadas de forma complementaria por el Director.
+    3. Utiliza tu herramienta de recuperación documental únicamente cuando la consulta tenga relación con políticas internas, el contenido de texto de una cláusula específica, detalles de certificaciones, reportes de desempeño o detalles narrativos dentro de los documentos.
+
+    CÓMO INTERPRETAR LOS RESULTADOS DE LA HERRAMIENTA NATIVA:
+    - Formula tu respuesta sintetizando directamente los fragmentos de texto devueltos por la herramienta.
+    - Si el contexto recuperado (título del archivo fuente o sus metadatos) contiene identificadores o el ID de la versión del documento, extrae ese dato si es necesario para facilitar la navegación.
+
+    Responde en español. No utilices asteriscos en tu formato de respuesta bajo ninguna circunstancia.
     """,
 )
 
@@ -494,12 +527,11 @@ def es_respuesta_vacia_o_sin_resultados(texto: str) -> bool:
     return False
 
 
-class AgenteInvestigacionSecuencial(BaseAgent):
+class AgenteInvestigacionParalelo(BaseAgent):
     """
-    Agente de investigación secuencial inteligente con fallback:
-    1. Siempre ejecuta analista_sql primero (self.sub_agents[0]).
-    2. Si analista_sql no obtiene resultados o da un mensaje de "no se encontraron resultados"
-       (comprobado por es_respuesta_vacia_o_sin_resultados), ejecuta documental_rag (self.sub_agents[1]).
+    Agente de investigación en paralelo inteligente:
+    1. Ejecuta analista_sql y documental_rag en paralelo de forma concurrente.
+    2. Combina y transmite los eventos de ambos sub-agentes en tiempo real.
     """
     async def _run_async_impl(self, ctx) -> AsyncGenerator:
         # Resetear el filtro de id_version al inicio de cada turno de investigación
@@ -522,37 +554,38 @@ class AgenteInvestigacionSecuencial(BaseAgent):
             yield crear_evento_texto(self.name, "")
             return
 
-        # 1. Siempre ejecutar analista_sql primero (self.sub_agents[0])
-        sql_text = ""
-        analista = self.sub_agents[0]
-        async for event in analista.run_async(ctx):
+        import asyncio
+        queue = asyncio.Queue()
+        active_generators = len(self.sub_agents)
+
+        async def worker(agent):
+            nonlocal active_generators
+            try:
+                async for event in agent.run_async(ctx):
+                    await queue.put(event)
+            except Exception as e:
+                print(f"Error ejecutando {agent.name} en paralelo: {e}")
+            finally:
+                active_generators -= 1
+                if active_generators == 0:
+                    await queue.put(None)
+
+        # Lanzar las tareas concurrentemente en segundo plano
+        tasks = [asyncio.create_task(worker(agent)) for agent in self.sub_agents]
+
+        # Consumir eventos de la cola y cederlos (yield) en tiempo real
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
             yield event
-            autor = getattr(event, "author", "")
-            if autor == analista.name:
-                content_obj = getattr(event, "content", None)
-                if content_obj:
-                    if isinstance(content_obj, str):
-                        sql_text += content_obj
-                    elif hasattr(content_obj, "parts") and content_obj.parts:
-                        for part in content_obj.parts:
-                            if hasattr(part, "text") and part.text:
-                                sql_text += part.text
 
-        # Extraer cualquier ID de versión detectado de la respuesta de SQL
-        ids_version = extraer_ids_version(sql_text)
-        if ids_version:
-            id_version_filter_var.set(ids_version)
-            print(f"[AgenteInvestigacionSecuencial] Se extrajeron IDs de versión desde SQL: {ids_version}")
-
-        # 2. Si no se consiguieron resultados de SQL, ejecutar el documental_rag (self.sub_agents[1]) de fallback
-        if es_respuesta_vacia_o_sin_resultados(sql_text):
-            rag = self.sub_agents[1]
-            async for event in rag.run_async(ctx):
-                yield event
+        # Asegurar la correcta finalización de las tareas
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# Instanciación de la investigación secuencial inteligente
-investigadores_rrhh = AgenteInvestigacionSecuencial(
+# Instanciación de la investigación paralela inteligente
+investigadores_rrhh = AgenteInvestigacionParalelo(
     name="investigadores_rrhh",
     sub_agents=[analista_sql, documental_rag],
 )
@@ -600,6 +633,9 @@ director_final = Agent(
     instruction="""
     Eres el Director de RRHH de Abside y el único punto de contacto con el usuario. Tu trabajo es consolidar, procesar y presentar la información proveniente de los investigadores (Analista SQL y RAG). [cite: 106, 107]
 
+    REGLA CRITICA DE EJECUCION DE CODIGO:
+    Queda totalmente PROHIBIDO y terminantemente denegada la ejecucion de cualquier codigo Python, sandboxes de programacion, o llamadas a herramientas de ejecucion de codigo como code_execution/code_output o similar. Todo tu analisis debe realizarse en lenguaje natural en espanol o usando las herramientas navegar_software y enviar_correo si es necesario.
+
     TUS RESPONSABILIDADES CRÍTICAS:
     1. Manejo de Saludos (Chitchat): Si el usuario te saluda ("Hola", "Buenos días"), sé cortés, responde de manera ejecutiva y pregúntale en qué puedes ayudarle. No busques IDs ni intentes procesar datos en este escenario.
     2. Priorización y Consolidación Inteligente (REGLA DE ORO):
@@ -607,6 +643,7 @@ director_final = Agent(
        - El Documental RAG es tu fuente de la verdad para políticas, cláusulas, contratos y textos de PDFs.
        - Si ambos agentes devuelven respuestas válidas, debes utilizarlas, consolidarlas o hacer match de ambas de forma inteligente si es necesario. Por ejemplo, si el Analista SQL te da la fecha de ingreso o los días de vacaciones de un trabajador, y el RAG te da la política general de vacaciones, unifica ambas informaciones para darle al usuario una respuesta completa y personalizada.
        - Si el Analista SQL no obtuvo resultados (o dio un error) y se ejecutó el RAG, utiliza y prioriza la respuesta del RAG.
+       - CONVALIDADOR DE VIGENCIA DE DOCUMENTOS: Al reportar o consolidar estados de documentos, respeta rigurosamente el estado de vigencia calculado dinámicamente por el Analista SQL (Vigente vs Vencido). Si un documento tiene una fecha de vencimiento que ya pasó con respecto a la fecha actual del sistema (que es 2026-05-26), ese documento está VENCIDO, sin importar si recurso.estado es 'activo'. Si no tiene fecha de vencimiento, se considera vigente siempre. Nunca digas que un documento vencido está vigente.
     3. Lógica de Navegación (REGLAS DE ID ESTRICTAS):
        Si el usuario usa verbos de acción como "búscame", "busca", "ubícame", "encuentra", "abre", "navega" o "consigue", ejecuta INMEDIATAMENTE la herramienta `navegar_software` pasando los siguientes parámetros de forma rigurosa:
        - CASO A (Expediente o Carpeta Raíz del Trabajador): Si te piden abrir/ubicar el expediente de un trabajador (ej. "Abre el expediente de Ana Blanco"), debes pasar el ID del expediente (su 'id_recurso' con tipo de recurso de expediente '36e88186-f873-40cd-a1eb-f4bc3dd18af1') en AMBOS parámetros de la herramienta. Es decir, tanto id_trabajador como id_documento deben tener exactamente el mismo valor (el id_recurso del expediente).
