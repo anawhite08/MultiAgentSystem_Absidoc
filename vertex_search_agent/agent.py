@@ -288,11 +288,12 @@ analista_sql = Agent(
     Queda totalmente PROHIBIDO y terminantemente denegada la ejecucion de cualquier codigo Python, sandboxes de programacion, o llamadas a herramientas de ejecucion de codigo como code_execution/code_output o similar. Todo tu analisis debe realizarse unicamente mediante consultas SQL usando la herramienta ejecutar_consulta_sql_dinamica.
 
     ESQUEMA DE TABLAS DISPONIBLE:
-    - recurso (id_recurso, titulo, id_recurso_padre, id_version_activa, id_tipo_recurso, estado)
+    - recurso (id_recurso, titulo, id_recurso_padre, id_version_activa, id_tipo_recurso, estado, id_caso_uso)
     - version (id_version, fecha_vencimiento, metadata, id_recurso, resumen, fecha_creacion)
-    - tipo_recurso (id_tipo_recurso, estructura, nombre, descripcion) #Los tipos de recursos te dicen que documento estas tratando, si usas el campo 'nombre' puedes sabes si es una cedula, un pasaporte, un expediente, lo que sea, usalo para identificar que documento es. No hagas busquedas exactas de este campos nombre porque puede tener una codificacion previa, usa que contenga esa palabra y que no sea sensible a mayusculas y minusculas, y que no considere los acentos porque puede o no tenerlos usando la funcion unaccent().
+    - tipo_recurso (id_tipo_recurso, estructura, nombre, descripcion, id_caso_uso) #Los tipos de recursos te dicen que documento estas tratando, si usas el campo 'nombre' puedes sabes si es una cedula, un pasaporte, un expediente, lo que sea, usalo para identificar que documento es. No hagas busquedas exactas de este campos nombre porque puede tener una codificacion previa, usa que contenga esa palabra y que no sea sensible a mayusculas y minusculas, y que no considere los acentos porque puede o no tenerlos usando la funcion unaccent().
     - catalogo_tipos_expediente (id_tipo_expediente, nombre_tipo)
     - requisitos_expediente (id_tipo_expediente, id_tipo_recurso_obligatorio, obligatorio)
+    - caso_uso (id_caso_uso, nombre, activo) --> solo puedes responder preguntas que pertenezcan a id_caso_uso='9ae86ef0-ee8e-4a24-85e2-a159bc136cb5' (caso rrhh), los recursos que este campo es null, debes verificar si el padre lo tiene, si el padre lo tiene puedes responder sobre el
 
     REGLAS CRÍTICAS DE NEGOCIO:
     1. RELACIÓN DE METADATA: La columna 'metadata' (JSONB) se encuentra ÚNICAMENTE en la tabla 'version'. Para consultar, filtrar o extraer cualquier información de un documento, DEBES hacer un JOIN: `recurso r JOIN version v ON r.id_version_activa = v.id_version`. 
