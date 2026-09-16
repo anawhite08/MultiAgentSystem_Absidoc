@@ -59,15 +59,6 @@ def create_app() -> FastAPI:
     # Pasamos allow_origins=["*"] para activar de forma nativa el middleware de CORS en ADK
     app = get_fast_api_app(agents_dir=current_dir, web=True, allow_origins=["*"])
     
-    # Añadimos CORSMiddleware de forma explícita para asegurar soporte total de CORS en Cloud Run
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    
     # Add pure ASGI middleware to the FastAPI app
     app.add_middleware(StreamingHeadersMiddleware)
     
