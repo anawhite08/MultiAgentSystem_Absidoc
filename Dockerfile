@@ -5,17 +5,17 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED True
 ENV APP_HOME /app
 ENV GOOGLE_GENAI_USE_VERTEXAI true
-ENV GOOGLE_CLOUD_PROJECT absidedoc
+ENV GOOGLE_CLOUD_PROJECT gestor-documental-466614
 ENV GOOGLE_CLOUD_LOCATION us-central1
 ENV GOOGLE_ENGINE_ID absidedoc_1771937853551
 ENV AGENT_PATH /
 ENV SERVICE_NAME vertex_search_agent
 ENV APP_NAME vertex_search_agent_app
-ENV direccion absidedoc:us-central1:vzabsdocprd
+ENV direccion gestor-documental-466614:us-central1:test
 ENV userbd postgres
-ENV passwordbd K@*|o9gb*ayOa.XJ
+ENV passwordbd Abside.01
 ENV bd postgres
-ENV GESTOR_API_BASE_URL https://gestor-api-302797487278.us-central1.run.app
+ENV GESTOR_API_BASE_URL https://mi-api-934853986529.us-central1.run.app
 WORKDIR $APP_HOME
 
 # 3. Instalar dependencias del sistema necesarias para conectores de BD (si fuera necesario)
