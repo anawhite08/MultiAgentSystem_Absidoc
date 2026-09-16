@@ -1,19 +1,31 @@
-import sys, os, re, contextvars
+import os
 from dotenv import load_dotenv
 from vertexai.preview import rag # (o 'from vertexai import rag' si tu SDK está muy actualizado)
-from vertexai.generative_models import Tool
 
 # Cargar variables de entorno del archivo .env local
 load_dotenv()
 
 import requests
 import sqlalchemy
-from google.adk.agents import Agent, BaseAgent, SequentialAgent, ParallelAgent
+from google.adk.agents import Agent, BaseAgent
+from google.adk.models import Gemini
+from google.adk.tools.agent_tool import AgentTool
 from google.adk.events import Event
+from google.genai import Client
 from google.genai.types import Content, Part
 from google.adk.tools import google_search
 from typing import AsyncGenerator
-from .__init__ import GOOGLE_CLOUD_PROJECT,GESTOR_API_BASE_URL, GOOGLE_CLOUD_LOCATION, GOOGLE_ENGINE_ID,GOOGLE_CORPUS_ID,GOOGLE_BD_DIRECCION,GOOGLE_BD_USER,GOOGLE_BD_PASSWORDBD ,GOOGLE_BD_BD 
+from functools import cached_property
+from .__init__ import GOOGLE_CLOUD_PROJECT,GESTOR_API_BASE_URL, GOOGLE_CLOUD_LOCATION,GOOGLE_CORPUS_ID,GOOGLE_BD_DIRECCION,GOOGLE_BD_USER,GOOGLE_BD_PASSWORDBD ,GOOGLE_BD_BD
+
+
+# --- MODELO GEMINI 3.x: requiere el endpoint "global" de Vertex AI (no una
+# región concreta como us-central1, donde el publisher model no existe),
+# mientras que el corpus RAG y Cloud SQL siguen usando GOOGLE_CLOUD_LOCATION. ---
+class GlobalGemini(Gemini):
+    @cached_property
+    def api_client(self) -> Client:
+        return Client(enterprise=True, project=GOOGLE_CLOUD_PROJECT, location="global")
 
 
 # --- HELPER DE EVENTOS ADK ---
@@ -23,19 +35,7 @@ def crear_evento_texto(autor: str, texto: str, partial: bool = None) -> Event:
         content=Content(parts=[Part(text=texto)]),
         partial=partial
     )
-from google.cloud import discoveryengine_v1 as discoveryengine
 from google.cloud.sql.connector import Connector, IPTypes
-
-
-# --- VARIABLE DE CONTEXTO ASÍNCRONA PARA FILTRADO DE RAG ---
-id_version_filter_var = contextvars.ContextVar("id_version_filter", default=None)
-
-def extraer_ids_version(texto: str) -> list:
-    """Extrae cualquier ID de versión con formato [VERSION_ID: UUID] de un texto."""
-    if not texto:
-        return []
-    pattern = r"\[VERSION_ID:\s*([a-zA-Z0-9\-]+)\]"
-    return re.findall(pattern, texto, re.IGNORECASE)
 
 # --- CONEXIÓN SQL (lazy pool) ---
 db_connector = None
@@ -93,140 +93,76 @@ def ejecutar_consulta_sql_dinamica(query: str) -> str:
             return f"Error en SQL: {str(e)}"
 
 
-# --- CLIENTE VERTEX AI SEARCH (lazy loader) ---
-vertex_search_client = None
-
-def consultar_documentos_rrhh(consulta: str) -> str:
+def consultar_documentos_rrhh(
+    consulta: str,
+    contexto_trabajador: str = "",
+    ids_version_esperados: list = None,
+) -> str:
     """
     Busca información específica en los expedientes, políticas y PDFs de los trabajadores.
-    Debe recibir la pregunta o los términos de búsqueda detallados.
+
+    Args:
+        consulta: pregunta o términos de búsqueda semántica (texto libre).
+        contexto_trabajador: nombre completo y/o cédula del trabajador, si se conoce
+            (se antepone al texto de búsqueda para reforzar la precisión semántica).
+        ids_version_esperados: UUIDs de la columna 'id_version' de la tabla 'version'
+            en Cloud SQL, resueltos previamente por el especialista SQL. El corpus RAG
+            nombra cada archivo como '{id_version}.pdf', así que el 'source_uri' que
+            devuelve cada fragmento de rag.retrieval_query permite priorizar/filtrar en
+            código, sin tocar la ingesta ni usar rag_file_ids, si el fragmento pertenece
+            al documento correcto.
     """
+    ids_version_esperados = [i.strip().lower() for i in (ids_version_esperados or []) if i and i.strip()]
+    texto_query = f"{contexto_trabajador}. {consulta}".strip(". ") if contexto_trabajador else consulta
+
     try:
         corpus_name = f"projects/{GOOGLE_CLOUD_PROJECT}/locations/{GOOGLE_CLOUD_LOCATION}/ragCorpora/{GOOGLE_CORPUS_ID}"
-        
-        # Consultamos el RAG manualmente usando retrieval_query
+
+        # Si hay ids_version esperados, pedimos más candidatos para tener margen de filtrar sin perder recall.
+        top_k = 10 if ids_version_esperados else 5
+
         response = rag.retrieval_query(
-            text=consulta,
+            text=texto_query,
             rag_resources=[rag.RagResource(rag_corpus=corpus_name)],
-            similarity_top_k=5 # Devuelve los 5 mejores fragmentos
+            similarity_top_k=top_k,
         )
-        
+
         if not response or not getattr(response, "contexts", None) or not response.contexts.contexts:
             return "No se encontró información relevante en los documentos de RRHH para esta consulta."
-            
+
+        contexts = list(response.contexts.contexts)
+        nota_interna = ""
+
+        if ids_version_esperados:
+            def _stem(uri: str) -> str:
+                base = uri.rsplit("/", 1)[-1]
+                if base.lower().endswith(".pdf"):
+                    base = base[: -len(".pdf")]
+                return base.strip().lower()
+
+            coincidencias = [c for c in contexts if _stem(getattr(c, "source_uri", "") or "") in ids_version_esperados]
+            if coincidencias:
+                # Filtrado estricto: solo mostramos los fragmentos del documento correcto.
+                contexts = coincidencias
+            else:
+                # Degradación segura: no bloqueamos la respuesta si ningún fragmento matchea
+                # (id_version mal resuelto o documento aún no indexado), solo avisamos.
+                nota_interna = (
+                    "[AVISO INTERNO: ningún fragmento recuperado coincide por nombre de archivo con los "
+                    f"id_version esperados ({', '.join(ids_version_esperados)}); se muestran los mejores "
+                    "resultados semánticos disponibles, verifica el trabajador correcto antes de responder.]\n\n"
+                )
+
         fragmentos = []
-        for ctx in response.contexts.contexts:
+        for ctx in contexts:
             # Extraemos el nombre del archivo y el texto del fragmento
             origen = getattr(ctx, "source_uri", "Documento desconocido")
             texto = getattr(ctx, "text", "")
             fragmentos.append(f"--- ARCHIVO: {origen} ---\n{texto}")
-            
-        return "\n\n".join(fragmentos)
+
+        return nota_interna + "\n\n".join(fragmentos)
     except Exception as e:
         return f"Error al buscar en el corpus documental: {str(e)}"
-    
-
-
-def get_vertex_search_client():
-    global vertex_search_client
-    if vertex_search_client is None:
-        vertex_search_client = discoveryengine.SearchServiceClient(
-            client_options={"api_endpoint": "us-discoveryengine.googleapis.com"}
-        )
-    return vertex_search_client
-
-
-def vertex_ai_search(query: str) -> str:
-    """
-    Realiza una búsqueda semántica en los documentos/PDFs de RRHH.
-    Usa summary_spec para obtener una respuesta resumida generada por IA anclada en los documentos,
-    más los fragmentos extractivos de cada documento relevante.
-    """
-    try:
-        client = get_vertex_search_client()
-        serving_config = (
-            f"projects/{GOOGLE_CLOUD_PROJECT}/locations/us/collections/default_collection"
-            f"/dataStores/{GOOGLE_ENGINE_ID}/servingConfigs/default_config"
-        )
-
-        # Configuración de contenido: respuestas extractivas + resumen semántico con IA
-        content_search_spec = discoveryengine.SearchRequest.ContentSearchSpec(
-            extractive_content_spec=discoveryengine.SearchRequest.ContentSearchSpec.ExtractiveContentSpec(
-                max_extractive_answer_count=3,
-                max_extractive_segment_count=3,
-                return_extractive_segment_score=True,
-            ),
-            summary_spec=discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec(
-                summary_result_count=5,
-                include_citations=True,
-                language_code="es",
-            ),
-        )
-
-        # Leer el filtro de ID de versión de ContextVar
-        ids_version = id_version_filter_var.get()
-        search_filter = None
-        if ids_version:
-            formatted_ids = ", ".join([f'"{id_}"' for id_ in ids_version])
-            search_filter = f"id: ANY({formatted_ids})"
-            print(f"[VERTEX_AI_SEARCH] Aplicando filtro de búsqueda por ID de versión: {search_filter}")
-
-        request = discoveryengine.SearchRequest(
-            serving_config=serving_config,
-            query=query,
-            page_size=5,
-            content_search_spec=content_search_spec,
-            filter=search_filter,
-        )
-        response = client.search(request)
-
-        parts = []
-
-        # 1. Resumen semántico generado por Vertex AI (respuesta directa a la pregunta)
-        if (
-            hasattr(response, "summary")
-            and response.summary
-            and response.summary.summary_text
-        ):
-            parts.append(f"RESUMEN SEMÁNTICO:\n{response.summary.summary_text}")
-
-        # 2. Fragmentos extractivos de cada documento relevante
-        doc_parts = []
-        for result in response.results:
-            doc = result.document
-            title = doc.name or "Sin título"
-            doc_id = doc.id or ""
-            content = ""
-            if doc.derived_struct_data:
-                # Prioridad: extractive_answers > extractive_segments > snippets
-                if "extractive_answers" in doc.derived_struct_data:
-                    answers = doc.derived_struct_data["extractive_answers"]
-                    content = " [...] ".join(
-                        [a.get("content", "") for a in answers if a.get("content")]
-                    )
-                elif "extractive_segments" in doc.derived_struct_data:
-                    segments = doc.derived_struct_data["extractive_segments"]
-                    content = " [...] ".join(
-                        [s.get("content", "") for s in segments if s.get("content")]
-                    )
-                elif "snippets" in doc.derived_struct_data:
-                    snippets = doc.derived_struct_data["snippets"]
-                    content = " [...] ".join(
-                        [s.get("snippet", "") for s in snippets if s.get("snippet")]
-                    )
-            if content:
-                doc_parts.append(f"ID_Documento: {doc_id} | Título: {title}\n{content}")
-
-        if doc_parts:
-            parts.append("DOCUMENTOS RELEVANTES:\n" + "\n\n".join(doc_parts))
-
-        return (
-            "\n\n".join(parts)
-            if parts
-            else "No se encontraron documentos relevantes para esta consulta."
-        )
-    except Exception as e:
-        return f"Error en la búsqueda de Vertex AI: {str(e)}"
 
 
 def navegar_software(id_trabajador: str, id_documento: str) -> dict:
@@ -279,7 +215,7 @@ def enviar_correo(correo_destino: str, asunto: str, cuerpo: str) -> str:
 # =============================================================================
 analista_sql = Agent(
     name="analista_sql",
-    model="gemini-2.5-pro",  # Cambiado a Pro para un análisis de alta precisión en PostgreSQL
+    model=GlobalGemini(model="gemini-3.1-flash-lite"),
     tools=[ejecutar_consulta_sql_dinamica],
     instruction="""
     Eres el Analista Experto en Base de Datos de RRHH. Tu única responsabilidad es generar y ejecutar consultas SQL en PostgreSQL para obtener datos estructurados.
@@ -377,19 +313,21 @@ analista_sql = Agent(
     - Haz un JOIN con la tabla `tipo_recurso` (usando `id_tipo_recurso` para obtener el tipo de documento, ej: `tr.nombre`) y con la tabla `version` (usando `id_version_activa = id_version` para obtener la metadata y fecha_vencimiento de cada documento).
     - Si el usuario pregunta por la estructura del expediente, explica que la relación es jerárquica, donde cada documento es un recurso hijo cuyo campo `id_recurso_padre` apunta al ID de la carpeta principal (expediente) del empleado.
 
-    RESOLUCIÓN CONDICIONAL DE DOCUMENTOS PARA FALLBACK:
+    RESOLUCIÓN CONDICIONAL DE DOCUMENTOS PARA FALLBACK Y RESOLUCIÓN DE IDENTIDAD PARA OTRO ESPECIALISTA:
     1. Si la pregunta es sobre el contenido narrativo, cláusulas, políticas particulares, reglamentos o texto libre dentro de un documento de un empleado específico (ej. "qué dice la cláusula de confidencialidad del contrato de Peter Labrador" o "cuáles son las condiciones del acuerdo de Juan"):
        - Primero, debes verificar si puedes responderla directamente con datos estructurados de las tablas.
        - Si NO puedes responderla porque la respuesta reside en el texto del PDF, debes ejecutar una consulta SQL para encontrar el `id_version_activa` (de la tabla `recurso`) o `id_version` (de la tabla `version`) de ese documento específico para ese empleado.
-       - REGLA DE ORO DE VERSIÓN: Al incluir la etiqueta `[VERSION_ID: <id_version>]`, debes usar ESTRICTAMENTE el valor de `id_version_activa` (o `id_version`). Queda TOTALMENTE PROHIBIDO usar el `id_recurso` (el ID del recurso/carpeta) en el tag de versión. Si usas el id_recurso, la búsqueda en Vertex AI Search fallará. Asegúrate de verificar y usar el UUID correcto de la versión (ej. el de 'id_version_activa' devuelto en tu consulta SQL).
+       - REGLA DE ORO DE VERSIÓN: Al incluir la etiqueta `[VERSION_ID: <id_version>]`, debes usar ESTRICTAMENTE el valor de `id_version_activa` (o `id_version`). Queda TOTALMENTE PROHIBIDO usar el `id_recurso` (el ID del recurso/carpeta) en el tag de versión. Asegúrate de verificar y usar el UUID correcto de la versión (ej. el de 'id_version_activa' devuelto en tu consulta SQL).
        - Una vez encontrado el ID de versión correcto, responde estrictamente incluyendo la etiqueta `[VERSION_ID: <id_version>]` en tu respuesta, acompañado de un mensaje indicando que localizaste el documento pero la consulta semántica detallada debe ser procesada por el especialista de documentos (ej. "Se localizó el contrato del empleado Peter Labrador [VERSION_ID: 9fae1554-469b-4395-8167-9c60e4b8df25], delego la lectura de cláusulas al RAG.").
        - Si no encuentras ningún ID de versión para ese documento en SQL, no agregues la etiqueta y responde normalmente.
+    2. REGLA DE IDENTIFICACIÓN PARA OTRO ESPECIALISTA: Si la petición que recibes es una solicitud de identificación hecha por el Director (no necesariamente una pregunta directa de un usuario final), por ejemplo "Identifica al trabajador Juan Pérez y el id_version de su contrato vigente para consulta semántica", debes resolverla igual: busca al trabajador aplicando la Regla de Desambiguación por Cédula, y responde de forma estructurada y compacta así:
+       `IDENTIFICACION: <nombre completo> | CEDULA: <cedula o 'no disponible'>`
+       seguido de una o más etiquetas `[VERSION_ID: <id_version>]` (una por cada documento relevante encontrado, usando siempre `id_version_activa`/`id_version`, nunca `id_recurso`). Si hay múltiples expedientes por desambiguar, aplica la Regla de Desambiguación por Cédula igual que siempre antes de responder. Si no encuentras ningún id_version, responde solo con la línea IDENTIFICACION (sin etiquetas VERSION_ID).
 
     REGLA DE LISTADO COMPLETO (CRÍTICA):
     - Cuando ejecutes una consulta SQL que arroje múltiples registros o resultados (por ejemplo, personas con documentos vencidos, cumpleaños de trabajadores, listados de contratos, etc.), debes listar y reportar TODOS los registros devueltos por la base de datos en tu respuesta final.
     - Queda estrictamente PROHIBIDO truncar la lista de resultados o limitar la respuesta de forma arbitraria a un número pequeño de registros (como solo mostrar 3 resultados), a menos que el usuario lo haya solicitado de forma explícita en su mensaje (ej. 'muestra los 3 primeros').
 
-    IMPORTANTE: Si la pregunta del usuario es un saludo (ej. "Hola", "Buenos días") o se refiere exclusivamente a políticas generales de la empresa (sin mencionar un empleado o documento estructurado donde consultar metadata de BD), responde de inmediato con un texto vacío "" para no interferir en la respuesta final y permitir que el RAG responda directamente. No intentes dar explicaciones de cortesía ni disculparte, pues eso evitaría que el Director consolide de forma limpia la respuesta del RAG.
     Responde en español. Sin asteriscos (*) en absoluto.
     """,
 )
@@ -399,7 +337,7 @@ analista_sql = Agent(
 # =============================================================================
 documental_rag = Agent(
     name="documental_rag",
-    model="gemini-2.5-pro",  # Cambiado a Pro para mejor interpretación de PDFs y políticas de RRHH
+    model=GlobalGemini(model="gemini-3.1-flash-lite"),
     tools=[consultar_documentos_rrhh],
     instruction="""
     Eres el Especialista en Documentos de RRHH. Tienes acceso a una base de conocimiento que contiene expedientes digitalizados y PDFs de múltiples trabajadores de la empresa. Tu única responsabilidad es buscar información dentro de este texto no estructurado usando la herramienta consultar_documentos_rrhh de manera exclusiva.
@@ -414,10 +352,14 @@ documental_rag = Agent(
     1. Cuando se te pregunte por un trabajador específico, tu consulta en la herramienta de búsqueda DEBE incluir siempre el nombre, apellido o identificador del trabajador.
     2. Al recibir los documentos recuperados, verifica estrictamente que el texto pertenezca al trabajador solicitado antes de emitir tu respuesta. Si el fragmento habla de otra persona, debes asumir que no tienes la información y responder que no se encontraron datos en el expediente de ese trabajador en particular.
 
-    REGLAS DE CONVIVENCIA CON EL ANALISTA SQL:
-    1. Si el usuario te pide listar los documentos de un trabajador o buscar datos exactos como fechas de ingreso, salarios base o IDs, NO inventes datos. Si la consulta es EXCLUSIVAMENTE sobre estos datos estructurados de base de datos y no requiere ninguna búsqueda en documentos o políticas, responde únicamente con un texto vacío "" para no interferir.
-    2. Si la consulta es MIXTA (ej. "días de vacaciones de Ana y qué dice la política") o contiene solicitudes sobre políticas, cláusulas, certificaciones, desempeño o información de texto dentro de los documentos, DEBES ejecutar tu herramienta de búsqueda semántica y responder con la información del texto encontrada. No te quedes callado por el hecho de que se mencione a un empleado o datos de SQL; ambos agentes operan en paralelo y sus respuestas serán consolidadas de forma complementaria por el Director.
-    3. Utiliza tu herramienta de recuperación documental únicamente cuando la consulta tenga relación con políticas internas, el contenido de texto de una cláusula específica, detalles de certificaciones, reportes de desempeño o detalles narrativos dentro de los documentos.
+    REGLAS DE INVOCACIÓN: El Director te invoca únicamente cuando decide que la respuesta requiere contenido narrativo/semántico (políticas, cláusulas, certificaciones, desempeño, texto libre de un documento). Puede invocarte solo, o después de haber consultado primero al Analista SQL para identificar al trabajador exacto. No asumas que el Analista SQL corrió en paralelo contigo ni que existe alguna otra fuente de datos consultándose al mismo tiempo; responde únicamente en base a lo que tú encuentres con tu herramienta.
+
+    USO DEL CONTEXTO DE IDENTIDAD RECIBIDO:
+    Si el mensaje que recibes incluye una línea `CONTEXTO_TRABAJADOR:` (nombre y/o cédula) y/o una línea `ID_VERSION_CONTEXTO:` (uno o más UUIDs separados por coma), DEBES:
+    1. Incluir el nombre del trabajador dentro del texto de tu parámetro `consulta` al llamar a `consultar_documentos_rrhh` (refuerza la búsqueda semántica).
+    2. Pasar el nombre/cédula recibido en el parámetro `contexto_trabajador` de la herramienta.
+    3. Pasar la lista de UUIDs recibida (separada por comas, sin corchetes) en el parámetro `ids_version_esperados` de la herramienta.
+    Aunque la herramienta ya prioriza/filtra fragmentos cuyo archivo coincide con esos UUIDs, SIEMPRE verifica igualmente en el texto recuperado que el contenido corresponda al trabajador correcto antes de responder — es una segunda capa de verificación, no un reemplazo de la primera. Si la herramienta devuelve un `[AVISO INTERNO: ...]` de que ningún fragmento coincidió por nombre de archivo, sé especialmente cauteloso y acláralo si no puedes confirmar que el contenido pertenece al trabajador correcto.
 
     CÓMO INTERPRETAR LOS RESULTADOS DE LA HERRAMIENTA NATIVA:
     - Formula tu respuesta sintetizando directamente los fragmentos de texto devueltos por la herramienta.
@@ -428,32 +370,14 @@ documental_rag = Agent(
 )
 
 # =============================================================================
-# SUB-AGENTE 3: BUSCADOR WEB + ACTIVADOR CONDICIONAL
+# SUB-AGENTE 3: BUSCADOR WEB
 # google_search es un BuiltInTool — debe estar en su propio agente separado.
-# AgenteBuscadorCondicional lo envuelve y solo lo ejecuta si el usuario pide
-# explícitamente buscar en internet. Sin keywords → cero llamadas al modelo.
+# El coordinador (director_final) decide dinámicamente cuándo invocarlo.
 # =============================================================================
-
-# Palabras clave que indican intención de búsqueda en internet
-PALABRAS_CLAVE_WEB = [
-    "busca en internet",
-    "busca en google",
-    "busca online",
-    "busca en la web",
-    "información actualizada sobre",
-    "noticias de",
-    "busca afuera",
-    "consulta en internet",
-    "consúltalo en internet",
-    "búsqueda web",
-    "buscar en internet",
-    "qué dice internet",
-    "google esto",
-]
 
 buscador_web = Agent(
     name="buscador_web",
-    model="gemini-2.5-pro",
+    model=GlobalGemini(model="gemini-3.1-flash-lite"),
     tools=[google_search],
     instruction="""
     Eres el Especialista en Búsqueda Web. El usuario ha pedido explícitamente buscar información en internet.
@@ -463,190 +387,29 @@ buscador_web = Agent(
     """,
 )
 
-# =============================================================================
-# ENRUTADORES CONDICIONALES RÁPIDOS POR CÓDIGO
-# Evitan llamadas innecesarias a modelos de LLM si se pueden discernir por palabras clave.
-# =============================================================================
-
-KEYWORDS_SQL = [
-    "vacaciones", "cumple", "nacimiento", "contrato", "ingreso", "contratación",
-    "recurso", "expediente", "trabajador", "empleado", "lista", "listar",
-    "cumplen", "edad", "sueldo", "salario", "documento", "documentos",
-    "falta", "faltan", "completo", "incompleto", "completitud", "requisito", "requisitos"
-]
-
-KEYWORDS_RAG = [
-    "política", "politica", "cláusula", "clausula", "documento", "pdf", "norma",
-    "regla", "manual", "instructivo", "archivo", "acuerdo"
-]
-
 SALUDOS_CHITCHAT = [
     "hola", "buenos días", "buenos dias", "buenas tardes", "buenas noches",
     "gracias", "ok", "listo", "adiós", "adios", "chao"
 ]
 
-
-def es_respuesta_vacia_o_sin_resultados(texto: str) -> bool:
-    """
-    Determina si la respuesta generada por el Analista SQL está vacía, indica error
-    o no arrojó ningún resultado en base de datos.
-    """
-    if not texto:
-        return True
-    
-    # Remover cualquier ocurrencia de etiquetas VERSION_ID para evaluar la respuesta real
-    texto_limpio = re.sub(r"\[VERSION_ID:\s*[a-zA-Z0-9\-]+\]", "", texto, flags=re.IGNORECASE)
-    
-    clean = texto_limpio.strip().lower()
-    clean = clean.replace('"', '').replace("'", "").strip()
-    
-    if not clean:
-        return True
-        
-    # Indicadores de ausencia de datos o errores en la base de datos
-    indicadores = [
-        "no se encontraron resultados",
-        "no se encontró",
-        "no se encontraron",
-        "no tengo información",
-        "no tengo informacion",
-        "no hay información",
-        "no hay informacion",
-        "no se registra",
-        "no existe",
-        "error en sql",
-        "error de sql",
-        "[]",
-        "null",
-        "ningún resultado",
-        "ningun resultado",
-        "no tengo acceso",
-        "lo siento",
-        "mi función",
-        "mi funcion",
-        "no está en la base",
-        "no esta en la base",
-        "no tengo registros",
-        "no se registran",
-        "no tengo info"
-    ]
-    
-    for ind in indicadores:
-        if ind in clean:
-            return True
-            
-    # Si es extremadamente corto, probablemente es un valor de descarte
-    if len(clean) < 5:
-        return True
-        
-    return False
-
-
-class AgenteInvestigacionParalelo(BaseAgent):
-    """
-    Agente de investigación en paralelo inteligente:
-    1. Ejecuta analista_sql y documental_rag en paralelo de forma concurrente.
-    2. Combina y transmite los eventos de ambos sub-agentes en tiempo real.
-    """
-    async def _run_async_impl(self, ctx) -> AsyncGenerator:
-        # Resetear el filtro de id_version al inicio de cada turno de investigación
-        id_version_filter_var.set(None)
-
-        mensaje_usuario = ""
-        for event in reversed(ctx.session.events):
-            if event.author == "user" and event.content and event.content.parts:
-                for part in event.content.parts:
-                    if hasattr(part, "text") and part.text:
-                        mensaje_usuario = part.text
-                        break
-            if mensaje_usuario:
-                break
-
-        msg_lower = mensaje_usuario.lower().strip()
-        
-        # Si es un saludo simple o chitchat de palabras cortas, hacemos skip silencioso de la investigación
-        if msg_lower in SALUDOS_CHITCHAT or len(msg_lower) < 3:
-            yield crear_evento_texto(self.name, "")
-            return
-
-        import asyncio
-        queue = asyncio.Queue()
-        active_generators = len(self.sub_agents)
-
-        async def worker(agent):
-            nonlocal active_generators
-            try:
-                async for event in agent.run_async(ctx):
-                    await queue.put(event)
-            except Exception as e:
-                print(f"Error ejecutando {agent.name} en paralelo: {e}")
-            finally:
-                active_generators -= 1
-                if active_generators == 0:
-                    await queue.put(None)
-
-        # Lanzar las tareas concurrentemente en segundo plano
-        tasks = [asyncio.create_task(worker(agent)) for agent in self.sub_agents]
-
-        # Consumir eventos de la cola y cederlos (yield) en tiempo real
-        while True:
-            event = await queue.get()
-            if event is None:
-                break
-            yield event
-
-        # Asegurar la correcta finalización de las tareas
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-
-# Instanciación de la investigación paralela inteligente
-investigadores_rrhh = AgenteInvestigacionParalelo(
-    name="investigadores_rrhh",
-    sub_agents=[analista_sql, documental_rag],
-)
-
-
-class AgenteBuscadorCondicional(BaseAgent):
-    """
-    Agente condicional: solo invoca a buscador_web si el mensaje del usuario
-    contiene palabras clave de búsqueda web. Si no, hace un skip silencioso.
-    """
-
-    async def _run_async_impl(self, ctx) -> AsyncGenerator:
-        mensaje_usuario = ""
-        for event in reversed(ctx.session.events):
-            if event.author == "user" and event.content and event.content.parts:
-                for part in event.content.parts:
-                    if hasattr(part, "text") and part.text:
-                        mensaje_usuario = part.text
-                        break
-            if mensaje_usuario:
-                break
-
-        if any(kw in mensaje_usuario.lower() for kw in PALABRAS_CLAVE_WEB):
-            async for event in self.sub_agents[0].run_async(ctx):
-                yield event
-
-
-buscador_web_condicional = AgenteBuscadorCondicional(
-    name="buscador_web_condicional", sub_agents=[buscador_web]
-)
-
-orquestador = ParallelAgent(
-    name="orquestador",
-    sub_agents=[investigadores_rrhh, buscador_web_condicional],
-    description="Orquestador que ejecuta la búsqueda secuencial en RRHH y (opcionalmente) la web en paralelo.",
-)
+# =============================================================================
+# ESPECIALISTAS ENVUELTOS COMO AgentTool PARA EL COORDINADOR
+# El coordinador (director_final) decide, turno a turno, cuáles invocar (0, 1 o
+# varios), en vez de forzar su ejecución en paralelo como antes.
+# =============================================================================
+analista_sql_tool = AgentTool(agent=analista_sql)
+documental_rag_tool = AgentTool(agent=documental_rag)
+buscador_web_tool = AgentTool(agent=buscador_web)
 
 # =============================================================================
-# SUB-AGENTE FINAL: DIRECTOR (OPTIMIZADO CON CONSOLIDACIÓN)
+# SUB-AGENTE FINAL: DIRECTOR (COORDINADOR ÚNICO CON ENRUTAMIENTO DINÁMICO)
 # =============================================================================
 director_final = Agent(
     name="director_final",
-    model="gemini-2.5-pro",  # Cambiado a Pro para una síntesis inteligente, navegación y envío de correos
-    tools=[navegar_software, enviar_correo],
+    model=GlobalGemini(model="gemini-3.1-flash-lite"),
+    tools=[analista_sql_tool, documental_rag_tool, buscador_web_tool, navegar_software, enviar_correo],
     instruction="""
-    Eres el Director de RRHH de Abside y el único punto de contacto con el usuario. Tu trabajo es consolidar, procesar y presentar la información proveniente de los investigadores (Analista SQL y RAG). [cite: 106, 107]
+    Eres el Director de RRHH de Abside y el único punto de contacto con el usuario. Tienes control total del turno: decides tú mismo, en cada mensaje, si necesitas invocar a uno, varios o ninguno de tus especialistas (herramientas) antes de responder. Tu trabajo es consolidar, procesar y presentar la información proveniente de tus especialistas (Analista SQL, Documental RAG y Buscador Web). [cite: 106, 107]
 
     REGLA CRITICA DE EJECUCION DE CODIGO:
     Queda totalmente PROHIBIDO y terminantemente denegada la ejecucion de cualquier codigo Python, sandboxes de programacion, o llamadas a herramientas de ejecucion de codigo como code_execution/code_output o similar. Todo tu analisis debe realizarse en lenguaje natural en espanol o usando las herramientas navegar_software y enviar_correo si es necesario.
@@ -693,173 +456,37 @@ director_final = Agent(
       - CASO 2: Si las cédulas son diferentes (representan a personas distintas con el mismo nombre), debes detener la evaluación y preguntar de inmediato al usuario cuál de las cédulas encontradas es la que solicita consultar, listando claramente todas las opciones de cédula de forma amigable. No muestres datos de los expedientes hasta que el usuario elija.
     - REGLA DE TURNO ACTUAL (CRÍTICA): Debes responder ÚNICAMENTE basándote en la consulta del usuario en el turno actual y en los resultados arrojados por los investigadores para este turno específico. Queda estrictamente PROHIBIDO mezclar, repetir, heredar o arrastrar resultados de listados o consultas de turnos anteriores (por ejemplo, si el usuario antes preguntó por "cédulas vencidas" y ahora pregunta por "abrir el expediente de Juan", NO debes incluir en tu respuesta actual la lista de cédulas vencidas ni mezclar información de turnos previos, responde únicamente a la solicitud actual).
     - Queda estrictamente PROHIBIDO el uso de asteriscos (*) bajo cualquier circunstancia en tus respuestas. No utilices negritas de markdown (no uses '**' ni '*'). Si necesitas dar énfasis o destacar títulos/secciones, escríbelas en MAYÚSCULAS o simplemente como texto normal sin símbolos adicionales. Tampoco uses asteriscos para viñetas (usa guiones medios '-' o numeración).
-    - Queda absolutamente PROHIBIDO mostrar cualquier etiqueta de metadatos interna como `[VERSION_ID: ...]` en tu respuesta final al usuario. Esas etiquetas son de uso interno exclusivo del sistema de fallback.
-    - Identifica al trabajador por su nombre/título. 
+    - Queda absolutamente PROHIBIDO mostrar cualquier etiqueta de metadatos interna como `[VERSION_ID: ...]`, `IDENTIFICACION:`, `CONTEXTO_TRABAJADOR:` o `ID_VERSION_CONTEXTO:` en tu respuesta final al usuario. Esas etiquetas son de uso interno exclusivo entre tú y tus especialistas.
+    - Identifica al trabajador por su nombre/título.
+
+    REGLAS DE ENRUTAMIENTO DINÁMICO (CÓMO DECIDIR QUÉ ESPECIALISTA INVOCAR):
+    Tienes disponibles tres especialistas como herramientas invocables: analista_sql (fuente de la verdad para datos estructurados: vacaciones, cumpleaños, expedientes, listas de documentos, vigencias, IDs de recurso), documental_rag (fuente de la verdad para políticas, cláusulas, contenido narrativo de PDFs) y buscador_web (búsqueda en internet).
+    1. Si el mensaje es un saludo o chitchat puro, no invoques ningún especialista; responde directamente de forma cortés.
+    2. Si la pregunta requiere datos estructurados (vacaciones, fechas, listados, completitud de expediente, vigencia de documentos), invoca analista_sql.
+    3. Si la pregunta requiere contenido de texto/política GENERAL (no ligada a un trabajador específico, ej. "qué dice la política de vacaciones de la empresa"), invoca documental_rag directamente, sin pasar por SQL.
+    4. REGLA SQL-ANTES-QUE-RAG (CRÍTICA): Si la pregunta requiere contenido narrativo/semántico de un documento de UN trabajador específico (ej. "qué dice la cláusula de confidencialidad del contrato de Juan Pérez"), DEBES primero invocar a analista_sql pidiéndole explícitamente identificar al trabajador y el/los id_version del documento relevante (usa una petición como: "Identifica al trabajador <nombre> y el id_version de su <tipo de documento> vigente para consulta semántica"). Extrae de su respuesta el nombre, la cédula (si viene) y cualquier etiqueta `[VERSION_ID: <uuid>]`. Luego invoca a documental_rag componiendo tu petición en este formato exacto:
+       CONTEXTO_TRABAJADOR: <nombre completo>, cédula <cedula o 'no disponible'>
+       ID_VERSION_CONTEXTO: <uuid1>, <uuid2>, ...
+       PREGUNTA: <la pregunta original del usuario sobre el contenido>
+       Si analista_sql no encontró ningún id_version, invoca igual a documental_rag pero omite la línea ID_VERSION_CONTEXTO (deja solo CONTEXTO_TRABAJADOR y PREGUNTA) para que al menos use el nombre como refuerzo semántico.
+    5. Si la pregunta es MIXTA (requiere datos estructurados Y contenido narrativo), invoca a ambos especialistas (SQL primero si hay identificación de por medio, según la regla 4) y consolida sus respuestas según la Regla de Oro de Priorización y Consolidación ya descrita arriba.
+    6. Invoca buscador_web ÚNICAMENTE si el usuario pide explícitamente buscar en internet, en la web, en Google, noticias externas o información actualizada que no pertenece a RRHH interno (ej. "busca en internet...", "qué dice internet sobre...", "noticias de..."). Nunca lo invoques por iniciativa propia para responder preguntas de RRHH.
     """,
 )
 
 # =============================================================================
-# DIRECTOR OPTIMIZADO POR CÓDIGO
+# FAST-PATH DE SALUDOS SOBRE EL COORDINADOR ÚNICO
 # =============================================================================
-# class AgenteDirectorOptimizado(BaseAgent):
-#     """
-#     Director final de RRHH de Abside, optimizado con:
-#     1. Intercepción y respuesta ultra-rápida (0.01s) para saludos y chitchat básico por código.
-#     2. Atajo (Bypass) del LLM si el orquestador ya produjo la respuesta de un investigador único
-#        y no se requiere ejecutar herramientas (navegar o enviar correo). Esto ahorra un LLM completo (~1.5s).
-#     """
-
-#     async def _run_async_impl(self, ctx) -> AsyncGenerator:
-#         # 1. Obtener el último mensaje del usuario
-#         mensaje_usuario = ""
-#         for event in reversed(ctx.session.events):
-#             if event.author == "user" and event.content and event.content.parts:
-#                 for part in event.content.parts:
-#                     if hasattr(part, "text") and part.text:
-#                         mensaje_usuario = part.text
-#                         break
-#             if mensaje_usuario:
-#                 break
-
-#         msg_lower = mensaje_usuario.lower().strip()
-
-#         # --- OPTIMIZACIÓN A: RESPUESTA ESTÁTICA PARA SALUDOS (0.01s) ---
-#         saludos_directos = {
-#             "hola": "¡Hola! Soy tu asistente de RRHH de Abside. ¿En qué te puedo colaborar el día de hoy? 😊",
-#             "buenos días": "¡Buenos días! Espero que estés excelente hoy. ¿En qué te puedo colaborar? ☀️",
-#             "buenos dias": "¡Buenos días! Espero que estés excelente hoy. ¿En qué te puedo colaborar? ☀️",
-#             "buenas tardes": "¡Buenas tardes! ¿En qué te puedo ayudar o colaborar el día de hoy? ☕",
-#             "buenas noches": "¡Buenas noches! ¿En qué te puedo colaborar antes de terminar el día? 🌙",
-#             "gracias": "¡Con muchísimo gusto! Quedo a tu entera disposición si necesitas consultar algo más sobre expedientes, vacaciones o políticas de RRHH. ¡Que tengas un excelente día! 👍",
-#             "gracias!": "¡Con muchísimo gusto! Quedo a tu entera disposición si necesitas consultar algo más sobre expedientes, vacaciones o políticas de RRHH. ¡Que tengas un excelente día! 👍",
-#             "muchas gracias": "¡Con muchísimo gusto! Quedo a tu entera disposición si necesitas consultar algo más sobre expedientes, vacaciones o políticas de RRHH. ¡Que tengas un excelente día! 👍",
-#             "ok": "¡Excelente! Quedo atento a cualquier otra consulta que desees realizar. ¡Que tengas un buen día! 👍",
-#             "listo": "¡Perfecto! Quedo atento si necesitas algo más. ¡Que tengas un excelente día! 👍",
-#             "adiós": "¡Hasta luego! Que tengas un excelente día. Estaré aquí cuando me necesites. ¡Hasta pronto! 👋",
-#             "adios": "¡Hasta luego! Que tengas un excelente día. Estaré aquí cuando me necesites. ¡Hasta pronto! 👋",
-#             "chao": "¡Hasta luego! Que tengas un excelente día. Estaré aquí cuando me necesites. ¡Hasta pronto! 👋"
-#         }
-
-#         if msg_lower in saludos_directos:
-#             yield crear_evento_texto("director_final", saludos_directos[msg_lower])
-#             return
-
-#         if msg_lower in SALUDOS_CHITCHAT:
-#             yield crear_evento_texto("director_final", "¡Hola! Soy tu asistente de RRHH de Abside. ¿En qué te puedo colaborar el día de hoy? 😊")
-#             return
-
-#         # --- OPTIMIZACIÓN B: BYPASS INTELIGENTE DEL LLM DEL DIRECTOR ---
-#         # Si un investigador ya devolvió una respuesta válida, y no se requiere ejecutar herramientas de acción del director
-#         # (como navegar en el software o enviar correo), podemos entregar directamente la respuesta del investigador.
-#         # Esto reduce 1 llamada secuencial de LLM, ahorrando entre 1.5 y 2.5 segundos.
-        
-#         # Palabras clave de acción que requieren la ejecución de herramientas del Director
-#         KEYWORDS_ACCION = ["busca", "búscame", "ubica", "ubícame", "encuentra", "abre", "consigue", "enviar", "envía", "enviame", "envíame", "correo", "email", "gmail"]
-#         requiere_accion = any(kw in msg_lower for kw in KEYWORDS_ACCION)
-
-#         # 1. Encontrar el índice del último mensaje del usuario para aislar el turno actual
-#         user_event_index = -1
-#         for i, event in enumerate(ctx.session.events):
-#             if getattr(event, "author", "") == "user":
-#                 user_event_index = i
-
-#         # 2. Buscar las respuestas de los investigadores en los eventos únicamente de este turno actual
-#         respuestas_acumuladas = {}
-#         events_to_scan = ctx.session.events[user_event_index + 1 :] if user_event_index != -1 else ctx.session.events
-
-#         for event in events_to_scan:
-#             autor = getattr(event, "author", "")
-#             if autor in ["analista_sql", "documental_rag", "buscador_web"]:
-#                 # Obtener el texto del contenido de forma robusta
-#                 content_text = ""
-#                 content_obj = getattr(event, "content", None)
-#                 if content_obj:
-#                     if isinstance(content_obj, str):
-#                         content_text = content_obj
-#                     elif hasattr(content_obj, "parts") and content_obj.parts:
-#                         parts_text = []
-#                         for part in content_obj.parts:
-#                             if hasattr(part, "text") and part.text:
-#                                 parts_text.append(part.text)
-#                         content_text = "".join(parts_text)
-                
-#                 content_text = content_text.strip()
-#                 # Considerar vacío si no tiene caracteres legibles o si solo contiene comillas vacías
-#                 if content_text and content_text.replace('"', '').replace("'", "").strip():
-#                     if autor not in respuestas_acumuladas:
-#                         respuestas_acumuladas[autor] = []
-#                     respuestas_acumuladas[autor].append(content_text)
-
-#         # 3. Consolidar respuestas, aplicando filtro de respuestas sin resultados
-#         respuestas_validas = {}
-#         for autor, partes in respuestas_acumuladas.items():
-#             # Filtrar duplicados exactos
-#             partes_unicas = []
-#             for p in partes:
-#                 if p not in partes_unicas:
-#                     partes_unicas.append(p)
-            
-#             # Simplificado: Unimos todas las partes únicas con un salto de línea
-#             texto_consolidado = "\n".join(partes_unicas).strip()
-            
-#             # Limpiar de forma definitiva las etiquetas VERSION_ID de la respuesta antes de evaluarla o presentarla
-#             texto_consolidado = re.sub(r"\[VERSION_ID:\s*[a-zA-Z0-9\-]+\]", "", texto_consolidado, flags=re.IGNORECASE).strip()
-                
-#             # Filtro inteligente: solo registrar respuesta en respuestas_validas si tiene contenido relevante
-#             if not es_respuesta_vacia_o_sin_resultados(texto_consolidado):
-#                 respuestas_validas[autor] = texto_consolidado
-
-#         # 4. Si no requiere acción y solo UN investigador tiene respuesta válida,
-#         # hacemos bypass directo del LLM del director, simulando el streaming en el backend para la interfaz.
-#         if not requiere_accion and len(respuestas_validas) == 1:
-#             autor_unico = list(respuestas_validas.keys())[0]
-#             texto_completo = respuestas_validas[autor_unico]
-            
-#             # Simulamos el streaming segmentando el texto en pequeños fragmentos (chunks)
-#             # de unas pocas palabras para lograr una animación visual de máquina de escribir fluida
-#             import asyncio
-#             palabras = texto_completo.split(" ")
-#             chunk_size = 4  # Enviar de a 4 palabras
-            
-#             for i in range(0, len(palabras), chunk_size):
-#                 chunk = " ".join(palabras[i : i + chunk_size])
-#                 if i + chunk_size < len(palabras):
-#                     chunk += " "
-#                 yield crear_evento_texto("director_final", chunk, partial=True)
-#                 await asyncio.sleep(0.015)  # Micro-pausa de 15ms para un efecto de scroll natural
-            
-#             # Yield final consolidated event so the turn completes beautifully with partial=None
-#             yield crear_evento_texto("director_final", texto_completo, partial=None)
-#             return
-
-#         # --- FLUJO NORMAL: RUN LLM DIRECTOR ---
-#         async for event in self.sub_agents[0].run_async(ctx):
-#             autor = getattr(event, "author", "")
-#             if autor == "director_final":
-#                 # Interceptar y limpiar cualquier residuo de etiqueta VERSION_ID en las respuestas del director
-#                 content_obj = getattr(event, "content", None)
-#                 if content_obj and hasattr(content_obj, "parts") and content_obj.parts:
-#                     for part in content_obj.parts:
-#                         if hasattr(part, "text") and part.text:
-#                             part.text = re.sub(r"\[VERSION_ID:\s*[a-zA-Z0-9\-]+\]", "", part.text, flags=re.IGNORECASE)
-#             yield event
-
-
-# director_final_optimizado = AgenteDirectorOptimizado(
-#     name="director_final_optimizado",
-#     sub_agents=[director_final]
-# )
-
-class AgenteDirectorOptimizado(BaseAgent):
+class DirectorConFastPath(BaseAgent):
     """
-    Director final de RRHH de Abside, optimizado con:
-    1. Intercepción y respuesta ultra-rápida (0.01s) para saludos y chitchat básico por código.
-    2. Atajo (Bypass) del LLM si el orquestador ya produjo la respuesta de un investigador único
-       y no se requiere ejecutar herramientas (navegar o enviar correo). Esto ahorra un LLM completo (~1.5s).
+    Wrapper delgado sobre el coordinador único (director_final): responde
+    saludos/chitchat comunes de forma instantánea, sin gastar una llamada LLM.
+    Para el resto de mensajes, delega íntegramente en director_final, que
+    decide por sí mismo (function-calling estándar de ADK) a cuáles
+    especialistas invocar y sintetiza la respuesta final en una sola pasada.
     """
 
     async def _run_async_impl(self, ctx) -> AsyncGenerator:
-        # 1. Obtener el último mensaje del usuario
         mensaje_usuario = ""
         for event in reversed(ctx.session.events):
             if event.author == "user" and event.content and event.content.parts:
@@ -872,7 +499,6 @@ class AgenteDirectorOptimizado(BaseAgent):
 
         msg_lower = mensaje_usuario.lower().strip()
 
-        # --- OPTIMIZACIÓN A: RESPUESTA ESTÁTICA PARA SALUDOS (0.01s) ---
         saludos_directos = {
             "hola": "¡Hola! Soy tu asistente de RRHH de Abside. ¿En qué te puedo colaborar el día de hoy? 😊",
             "buenos días": "¡Buenos días! Espero que estés excelente hoy. ¿En qué te puedo colaborar? ☀️",
@@ -897,107 +523,14 @@ class AgenteDirectorOptimizado(BaseAgent):
             yield crear_evento_texto("director_final", "¡Hola! Soy tu asistente de RRHH de Abside. ¿En qué te puedo colaborar el día de hoy? 😊")
             return
 
-        # --- OPTIMIZACIÓN B: BYPASS INTELIGENTE DEL LLM DEL DIRECTOR ---
-        # Si un investigador ya devolvió una respuesta válida, y no se requiere ejecutar herramientas de acción del director
-        # (como navegar en el software o enviar correo), podemos entregar directamente la respuesta del investigador.
-        # Esto reduce 1 llamada secuencial de LLM, ahorrando entre 1.5 y 2.5 segundos.
-        
-        # Palabras clave de acción que requieren la ejecución de herramientas del Director
-        KEYWORDS_ACCION = ["busca", "búscame", "ubica", "ubícame", "encuentra", "abre", "consigue", "enviar", "envía", "enviame", "envíame", "correo", "email", "gmail"]
-        requiere_accion = any(kw in msg_lower for kw in KEYWORDS_ACCION)
-
-        # 1. Encontrar el índice del último mensaje del usuario para aislar el turno actual
-        user_event_index = -1
-        for i, event in enumerate(ctx.session.events):
-            if getattr(event, "author", "") == "user":
-                user_event_index = i
-
-        # 2. Buscar las respuestas de los investigadores en los eventos únicamente de este turno actual
-        respuestas_acumuladas = {}
-        events_to_scan = ctx.session.events[user_event_index + 1 :] if user_event_index != -1 else ctx.session.events
-
-        for event in events_to_scan:
-            autor = getattr(event, "author", "")
-            if autor in ["analista_sql", "documental_rag", "buscador_web"]:
-                # Obtener el texto del contenido de forma robusta
-                content_text = ""
-                content_obj = getattr(event, "content", None)
-                if content_obj:
-                    if isinstance(content_obj, str):
-                        content_text = content_obj
-                    elif hasattr(content_obj, "parts") and content_obj.parts:
-                        parts_text = []
-                        for part in content_obj.parts:
-                            if hasattr(part, "text") and part.text:
-                                parts_text.append(part.text)
-                        content_text = "".join(parts_text)
-                
-                content_text = content_text.strip()
-                # Considerar vacío si no tiene caracteres legibles o si solo contiene comillas vacías
-                if content_text and content_text.replace('"', '').replace("'", "").strip():
-                    if autor not in respuestas_acumuladas:
-                        respuestas_acumuladas[autor] = []
-                    respuestas_acumuladas[autor].append(content_text)
-
-        # 3. Consolidar respuestas, aplicando filtro de respuestas sin resultados
-        respuestas_validas = {}
-        for autor, partes in respuestas_acumuladas.items():
-            # Filtrar duplicados exactos
-            partes_unicas = []
-            for p in partes:
-                if p not in partes_unicas:
-                    partes_unicas.append(p)
-            
-            # Simplificado: Unimos todas las partes únicas con un salto de línea
-            texto_consolidado = "\n".join(partes_unicas).strip()
-            
-            # Limpiar de forma definitiva las etiquetas VERSION_ID de la respuesta antes de evaluarla o presentarla
-            texto_consolidado = re.sub(r"\[VERSION_ID:\s*[a-zA-Z0-9\-]+\]", "", texto_consolidado, flags=re.IGNORECASE).strip()
-                
-            # Filtro inteligente: solo registrar respuesta en respuestas_validas si tiene contenido relevante
-            if not es_respuesta_vacia_o_sin_resultados(texto_consolidado):
-                respuestas_validas[autor] = texto_consolidado
-
-        # 4. Si no requiere acción y solo UN investigador tiene respuesta válida,
-        # hacemos bypass directo del LLM del director, simulando el streaming en el backend para la interfaz.
-        if not requiere_accion and len(respuestas_validas) == 1:
-            autor_unico = list(respuestas_validas.keys())[0]
-            texto_completo = respuestas_validas[autor_unico]
-            
-            # Simulamos el streaming segmentando el texto en pequeños fragmentos (chunks)
-            # de unas pocas palabras para lograr una animación visual de máquina de escribir fluida
-            import asyncio
-            palabras = texto_completo.split(" ")
-            chunk_size = 4  # Enviar de a 4 palabras
-            
-            for i in range(0, len(palabras), chunk_size):
-                chunk = " ".join(palabras[i : i + chunk_size])
-                if i + chunk_size < len(palabras):
-                    chunk += " "
-                yield crear_evento_texto("director_final", chunk, partial=True)
-                await asyncio.sleep(0.015)  # Micro-pausa de 15ms para un efecto de scroll natural
-            
-            # Yield final consolidated event so the turn completes beautifully with partial=None
-            yield crear_evento_texto("director_final", texto_completo, partial=None)
-            return
-
-        # --- FLUJO NORMAL: RUN LLM DIRECTOR ---
-        # Se ha eliminado el regex bloqueador para permitir el flujo asíncrono y streaming real.
         async for event in self.sub_agents[0].run_async(ctx):
             yield event
-
-
-director_final_optimizado = AgenteDirectorOptimizado(
-    name="director_final_optimizado",
-    sub_agents=[director_final]
-)
 
 
 # =============================================================================
 # AGENTE PRINCIPAL (root_agent)
 # =============================================================================
-root_agent = SequentialAgent(
+root_agent = DirectorConFastPath(
     name="vertex_search_agent",
-    sub_agents=[orquestador, director_final_optimizado],
-    description="Orquestador inteligente que enruta secuencialmente y luego sintetiza a través del director optimizado.",
+    sub_agents=[director_final],
 )

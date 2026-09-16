@@ -6,7 +6,7 @@ load_dotenv()
 
 from . import agent
 
-GOOGLE_ENGINE_ID = os.getenv("GOOGLE_ENGINE_ID")
+
 GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
 GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION")
 GOOGLE_BD_DIRECCION=os.getenv("direccion")
