@@ -1,4 +1,7 @@
 import os
+import re
+import uuid
+from contextlib import contextmanager
 from dotenv import load_dotenv
 from vertexai.preview import rag # (o 'from vertexai import rag' si tu SDK está muy actualizado)
 
@@ -69,19 +72,118 @@ def get_db_pool():
     return db_pool
 
 
+# =============================================================================
+# AISLAMIENTO POR CASO DE USO (MODO)
+# Este agente atiende UN solo modo, fijado por el despliegue (CASO_USO_ID), nunca
+# por lo que envíe el navegador ni por lo que decida el modelo. Todo acceso a datos
+# pasa por vistas temporales que solo exponen los recursos de ese modo.
+# =============================================================================
+CASO_USO_ID = str(uuid.UUID(os.getenv("CASO_USO_ID", "2336fa8c-cb25-4617-bd1b-0abd7a9e4208")))
+
+# Tablas de la BD que el agente puede ver (el resto se bloquea por nombre)
+_TABLAS_PERMITIDAS = {
+    "recurso", "version", "tipo_recurso",
+    "catalogo_tipos_expediente", "requisitos_expediente", "caso_uso",
+}
+_PALABRAS_PROHIBIDAS = {
+    "insert", "update", "delete", "drop", "alter", "create", "grant", "revoke",
+    "truncate", "copy", "call", "set", "execute", "do", "begin", "commit",
+    "rollback", "pg_temp", "information_schema", "public",
+}
+_tablas_bloqueadas = None
+
+
+def _obtener_tablas_bloqueadas():
+    """Tablas del esquema public que NO están permitidas (se consultan una vez)."""
+    global _tablas_bloqueadas
+    if _tablas_bloqueadas is None:
+        with get_db_pool().connect() as conn:
+            filas = conn.execute(sqlalchemy.text(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+            )).fetchall()
+        _tablas_bloqueadas = {f[0].lower() for f in filas} - _TABLAS_PERMITIDAS
+    return _tablas_bloqueadas
+
+
+def _validar_sql(query: str):
+    """Devuelve un mensaje de error si la consulta no es de solo lectura sobre tablas permitidas."""
+    q = query.strip().rstrip(";").strip()
+    if not q.lower().startswith(("select", "with")):
+        return "Error: Solo se permiten consultas de lectura (SELECT o WITH)."
+    if ";" in q:
+        return "Error: Solo se permite una consulta por ejecución."
+    # Se ignoran los literales de texto para no bloquear búsquedas como ILIKE '%usuario%'
+    sin_literales = re.sub(r"'(?:[^']|'')*'", "''", q.lower())
+    tokens = set(re.findall(r"[a-z_][a-z0-9_]*", sin_literales))
+    if tokens & _PALABRAS_PROHIBIDAS or any(t.startswith("pg_") for t in tokens):
+        return "Error: La consulta contiene instrucciones no permitidas."
+    if tokens & _obtener_tablas_bloqueadas():
+        return "Error: La consulta accede a tablas fuera del alcance de este modo."
+    return None
+
+
+@contextmanager
+def _conexion_con_alcance():
+    """
+    Conexión cuyas tablas `recurso`, `version` y `caso_uso` son vistas temporales
+    filtradas por CASO_USO_ID (un documento hijo hereda el modo de su expediente).
+    Todo se revierte al salir: nada se persiste.
+    """
+    _obtener_tablas_bloqueadas()
+    with get_db_pool().connect() as conn:
+        trans = conn.begin()
+        try:
+            conn.execute(sqlalchemy.text(f"""
+                CREATE TEMP VIEW recurso AS
+                SELECT r.* FROM public.recurso r
+                LEFT JOIN public.recurso p ON p.id_recurso = r.id_recurso_padre
+                WHERE COALESCE(p.id_caso_uso, r.id_caso_uso) = '{CASO_USO_ID}'::uuid
+            """))
+            conn.execute(sqlalchemy.text("""
+                CREATE TEMP VIEW version AS
+                SELECT v.* FROM public.version v
+                WHERE EXISTS (SELECT 1 FROM pg_temp.recurso r WHERE r.id_recurso = v.id_recurso)
+            """))
+            conn.execute(sqlalchemy.text(f"""
+                CREATE TEMP VIEW caso_uso AS
+                SELECT * FROM public.caso_uso WHERE id_caso_uso = '{CASO_USO_ID}'::uuid
+            """))
+            conn.execute(sqlalchemy.text("SET LOCAL search_path = pg_temp, public"))
+            conn.execute(sqlalchemy.text("SET LOCAL statement_timeout = '20s'"))
+            yield conn
+        finally:
+            trans.rollback()
+
+
+def _ids_existentes(columna: str, ids) -> set:
+    """Subconjunto de `ids` (id_version o id_recurso) que pertenece al modo de este agente."""
+    ids = [str(i).strip().lower() for i in ids if i]
+    ids = [i for i in ids if re.fullmatch(r"[0-9a-f-]{36}", i)]
+    if not ids:
+        return set()
+    tabla = "version" if columna == "id_version" else "recurso"
+    try:
+        with _conexion_con_alcance() as conn:
+            filas = conn.execute(
+                sqlalchemy.text(f"SELECT CAST({columna} AS TEXT) FROM {tabla} WHERE CAST({columna} AS TEXT) = ANY(:ids)"),
+                {"ids": ids},
+            ).fetchall()
+        return {f[0].lower() for f in filas}
+    except Exception as e:
+        print(f"[_ids_existentes] Error: {e}")
+        return set()
+
+
 # --- HERRAMIENTAS ---
 
 
 def ejecutar_consulta_sql_dinamica(query: str) -> str:
     """Ejecuta una consulta SQL SELECT para obtener datos estructurados de RRHH desde PostgreSQL."""
-    if not (
-        query.strip().lower().startswith("select")
-        or query.strip().lower().startswith("with")
-    ):
-        return "Error: Solo se permiten consultas de lectura (SELECT o WITH)."
-    pool = get_db_pool()
-    with pool.connect() as conn:
-        try:
+    error = _validar_sql(query)
+    if error:
+        return error
+    try:
+        with _conexion_con_alcance() as conn:
             result = conn.execute(sqlalchemy.text(query))
             rows = result.fetchall()
             colnames = result.keys()
@@ -89,8 +191,8 @@ def ejecutar_consulta_sql_dinamica(query: str) -> str:
             return (
                 str(formatted_res) if formatted_res else "No se encontraron resultados."
             )
-        except Exception as e:
-            return f"Error en SQL: {str(e)}"
+    except Exception as e:
+        return f"Error en SQL: {str(e)}"
 
 
 def consultar_documentos_rrhh(
@@ -132,6 +234,19 @@ def consultar_documentos_rrhh(
 
         contexts = list(response.contexts.contexts)
         nota_interna = ""
+
+        # Aislamiento por modo: solo fragmentos de archivos '{id_version}.pdf' que pertenezcan
+        # a este caso de uso. Lo demás (aunque el corpus lo contuviera) se descarta.
+        def _stem_archivo(uri: str) -> str:
+            base = (uri or "").rsplit("/", 1)[-1]
+            if base.lower().endswith(".pdf"):
+                base = base[: -len(".pdf")]
+            return base.strip().lower()
+
+        permitidos = _ids_existentes("id_version", [_stem_archivo(getattr(c, "source_uri", "")) for c in contexts])
+        contexts = [c for c in contexts if _stem_archivo(getattr(c, "source_uri", "")) in permitidos]
+        if not contexts:
+            return "No se encontró información relevante en los documentos de este modo para esta consulta."
 
         if ids_version_esperados:
             def _stem(uri: str) -> str:
@@ -175,6 +290,9 @@ def navegar_software(id_trabajador: str, id_documento: str) -> dict:
       * Si la solicitud es sobre un DOCUMENTO específico (ej. un contrato, una certificación, etc.), debe ser el 'id_recurso' de ese documento en específico.
       * Si la solicitud es sobre el EXPEDIENTE en sí mismo (ej. 'abre el expediente de Ana Blanco' o 'ubica el expediente'), se debe pasar el 'id_recurso' del expediente del trabajador en ambos parámetros. Es decir, id_documento debe ser exactamente IGUAL a id_trabajador.
     """
+    # Solo se puede navegar a expedientes/documentos de este modo
+    if len(_ids_existentes("id_recurso", [id_trabajador, id_documento])) < len({str(id_trabajador).lower(), str(id_documento).lower()}):
+        return {"error": "El expediente o documento solicitado no pertenece a este modo."}
     return {
         "action": "OPEN_EXPEDIENTE",
         "id_trabajador": id_trabajador,
@@ -229,7 +347,13 @@ analista_sql = Agent(
     - tipo_recurso (id_tipo_recurso, estructura, nombre, descripcion, id_caso_uso) #Los tipos de recursos te dicen que documento estas tratando, si usas el campo 'nombre' puedes sabes si es una cedula, un pasaporte, un expediente, lo que sea, usalo para identificar que documento es. No hagas busquedas exactas de este campos nombre porque puede tener una codificacion previa, usa que contenga esa palabra y que no sea sensible a mayusculas y minusculas, y que no considere los acentos porque puede o no tenerlos usando la funcion unaccent().
     - catalogo_tipos_expediente (id_tipo_expediente, nombre_tipo)
     - requisitos_expediente (id_tipo_expediente, id_tipo_recurso_obligatorio, obligatorio)
-    - caso_uso (id_caso_uso, nombre, activo) --> solo puedes responder preguntas que pertenezcan a id_caso_uso='9ae86ef0-ee8e-4a24-85e2-a159bc136cb5' (caso rrhh), los recursos que este campo es null, debes verificar si el padre lo tiene, si el padre lo tiene puedes responder sobre el
+    - caso_uso (id_caso_uso, nombre, activo)
+
+    ALCANCE DE DATOS (CRÍTICO, APLICADO POR EL SISTEMA):
+    - Las tablas recurso, version y caso_uso ya contienen ÚNICAMENTE los datos de ESTE modo de trabajo (RTS - RRHH). Es imposible ver información de otros modos y no debes intentarlo.
+    - Un EXPEDIENTE es un recurso RAÍZ: recurso.id_recurso_padre IS NULL (con tipo_recurso.nombre que contenga 'expediente'). Para listar expedientes usa siempre ese criterio. Los documentos son hijos directos de un expediente.
+    - Los UUID de tipo_recurso que aparecen más abajo pueden pertenecer a otro modo y NO ser válidos aquí: identifica siempre los tipos de documento por tipo_recurso.nombre (ILIKE y unaccent), no por esos UUID.
+    - Si el usuario pregunta por información de otros modos o de otras áreas de la empresa, responde que solo puedes ayudar con la información de RTS - RRHH.
 
     REGLAS CRÍTICAS DE NEGOCIO:
     1. RELACIÓN DE METADATA: La columna 'metadata' (JSONB) se encuentra ÚNICAMENTE en la tabla 'version'. Para consultar, filtrar o extraer cualquier información de un documento, DEBES hacer un JOIN: `recurso r JOIN version v ON r.id_version_activa = v.id_version`. 
@@ -409,6 +533,8 @@ director_final = Agent(
     model=GlobalGemini(model="gemini-3.1-flash-lite"),
     tools=[analista_sql_tool, documental_rag_tool, buscador_web_tool, navegar_software, enviar_correo],
     instruction="""
+    ALCANCE: Este asistente atiende exclusivamente el modo RTS - RRHH. Solo puedes responder sobre los expedientes y documentos de RTS - RRHH que te entregan tus especialistas. Si te preguntan por información de otros modos o áreas, indica amablemente que solo puedes ayudar con RTS - RRHH. Nunca completes con información de otros modos ni de tu conocimiento general sobre empleados.
+
     Eres el Director de RRHH de Abside y el único punto de contacto con el usuario. Tienes control total del turno: decides tú mismo, en cada mensaje, si necesitas invocar a uno, varios o ninguno de tus especialistas (herramientas) antes de responder. Tu trabajo es consolidar, procesar y presentar la información proveniente de tus especialistas (Analista SQL, Documental RAG y Buscador Web). [cite: 106, 107]
 
     REGLA CRITICA DE EJECUCION DE CODIGO:
@@ -452,12 +578,13 @@ director_final = Agent(
     - REGLA DE LISTADO COMPLETO (CRÍTICA): Cuando el Analista SQL o los investigadores reporten múltiples registros o resultados (como un listado de trabajadores, personas con documentos vencidos, cumpleaños, etc., o todos los documentos en un expediente de un empleado), estás obligado a incluir y listar TODOS y cada uno de los elementos reportados en tu respuesta final (por ejemplo, si el Analista SQL reporta los 14 documentos de Ana Blanco, debes listarlos todos uno por uno). Queda estrictamente PROHIBIDO truncar, resumir o limitar la lista de resultados de forma de listado parcial (como solo mostrar 3 o 5 resultados), a menos que el usuario lo haya solicitado de forma explícita en su mensaje actual.
     - REGLA DE DESAMBIGUACIÓN POR CÉDULA (REGLA CRÍTICA): Si el sistema encuentra expedientes duplicados con el mismo nombre o nombres similares:
       - Debes evaluar el número de cédula que está en la metadata de la versión activa de cada expediente (v.metadata ->> 'cedula').
-      - CASO 1: Si las cédulas son iguales (representan a la misma persona con registros duplicados), debes indicarle claramente al usuario que el expediente está duplicado en el sistema, listar todos los expedientes encontrados indicando explícitamente sus IDs, títulos y estado actual (mostrando de manera totalmente clara si están activos o inactivos), y luego proceder a consolidar la evaluación del expediente activo.
+      - CASO 1: Si las cédulas son iguales (representan a la misma persona con registros duplicados), debes indicarle claramente al usuario que el expediente está duplicado en el sistema, listar todos los expedientes encontrados indicando sus títulos y estado actual (mostrando de manera totalmente clara si están activos o inactivos), y luego proceder a consolidar la evaluación del expediente activo.
       - CASO 2: Si las cédulas son diferentes (representan a personas distintas con el mismo nombre), debes detener la evaluación y preguntar de inmediato al usuario cuál de las cédulas encontradas es la que solicita consultar, listando claramente todas las opciones de cédula de forma amigable. No muestres datos de los expedientes hasta que el usuario elija.
     - REGLA DE TURNO ACTUAL (CRÍTICA): Debes responder ÚNICAMENTE basándote en la consulta del usuario en el turno actual y en los resultados arrojados por los investigadores para este turno específico. Queda estrictamente PROHIBIDO mezclar, repetir, heredar o arrastrar resultados de listados o consultas de turnos anteriores (por ejemplo, si el usuario antes preguntó por "cédulas vencidas" y ahora pregunta por "abrir el expediente de Juan", NO debes incluir en tu respuesta actual la lista de cédulas vencidas ni mezclar información de turnos previos, responde únicamente a la solicitud actual).
     - Queda estrictamente PROHIBIDO el uso de asteriscos (*) bajo cualquier circunstancia en tus respuestas. No utilices negritas de markdown (no uses '**' ni '*'). Si necesitas dar énfasis o destacar títulos/secciones, escríbelas en MAYÚSCULAS o simplemente como texto normal sin símbolos adicionales. Tampoco uses asteriscos para viñetas (usa guiones medios '-' o numeración).
     - Queda absolutamente PROHIBIDO mostrar cualquier etiqueta de metadatos interna como `[VERSION_ID: ...]`, `IDENTIFICACION:`, `CONTEXTO_TRABAJADOR:` o `ID_VERSION_CONTEXTO:` en tu respuesta final al usuario. Esas etiquetas son de uso interno exclusivo entre tú y tus especialistas.
     - Identifica al trabajador por su nombre/título.
+    - REGLA DE IDENTIFICADORES (CRÍTICA): NUNCA muestres al usuario identificadores internos (UUID, id_recurso, id_version, id_tipo_recurso, ni ningún valor con formato de UUID), ni en listados, ni en tablas, ni entre paréntesis. Son datos internos irrelevantes para el usuario. Preséntalos únicamente a través de datos legibles: nombre y apellido, cédula, cargo, tipo de documento, fechas y estado. Los IDs solo se usan internamente para llamar a herramientas como navegar_software.
 
     REGLAS DE ENRUTAMIENTO DINÁMICO (CÓMO DECIDIR QUÉ ESPECIALISTA INVOCAR):
     Tienes disponibles tres especialistas como herramientas invocables: analista_sql (fuente de la verdad para datos estructurados: vacaciones, cumpleaños, expedientes, listas de documentos, vigencias, IDs de recurso), documental_rag (fuente de la verdad para políticas, cláusulas, contenido narrativo de PDFs) y buscador_web (búsqueda en internet).

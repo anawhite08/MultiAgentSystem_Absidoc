@@ -57,7 +57,7 @@ from fastapi.middleware.cors import CORSMiddleware
 def create_app() -> FastAPI:
     print(f"Initializing ADK web server from directory: {current_dir}")
     # Pasamos allow_origins=["*"] para activar de forma nativa el middleware de CORS en ADK
-    app = get_fast_api_app(agents_dir=current_dir, web=True, allow_origins=["*"])
+    app = get_fast_api_app(agents_dir=current_dir, web=False, allow_origins=["*"])
     
     # Add pure ASGI middleware to the FastAPI app
     app.add_middleware(StreamingHeadersMiddleware)
